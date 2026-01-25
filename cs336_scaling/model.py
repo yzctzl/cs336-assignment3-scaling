@@ -92,7 +92,7 @@ class BasicsTransformerLM(nn.Module):
             n_params -= self.token_embeddings.weight.numel()
         return n_params
 
-    def forward(self, x: torch.LongTensor):
+    def forward(self, x: torch.Tensor):
         """
         Args:
             x: LongTensor of shape `(batch_size, sequence_length)`.
@@ -131,7 +131,7 @@ class BasicsTransformerLM(nn.Module):
     @torch.no_grad()
     def generate(
         self,
-        x: torch.LongTensor,
+        x: torch.Tensor,
         max_new_tokens: int,
         temperature: float = 1.0,
         top_k: Optional[int] = None,

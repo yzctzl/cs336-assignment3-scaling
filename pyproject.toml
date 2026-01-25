@@ -5,13 +5,22 @@ description = "CS 336 Assignment 3: Scaling Laws"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.1",
+    "pyyaml>=6.0.3",
     "requests>=2.32.3",
+    "scipy>=1.17.0",
     "torch>=2.7.0",
+    "torch-npu>=2.7.0",
 ]
 
 [tool.uv]
 package = true
 python-preference = "managed"
+
+[[tool.uv.index]]
+url = "https://mirrors.bfsu.edu.cn/pypi/web/simple"
+default = true
 
 
 [tool.setuptools.packages.find]
