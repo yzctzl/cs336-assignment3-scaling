@@ -5,13 +5,21 @@ description = "CS 336 Assignment 3: Scaling Laws"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi>=0.128.0",
+    "httpx>=0.28.1",
     "matplotlib>=3.10.8",
     "numpy>=2.4.1",
+    "pandas>=3.0.0",
+    "pyarrow>=23.0.0",
     "pyyaml>=6.0.3",
     "requests>=2.32.3",
     "scipy>=1.17.0",
+    "tokenizers>=0.22.2",
     "torch>=2.7.0",
     "torch-npu>=2.7.0",
+    "tqdm>=4.67.1",
+    "uvicorn[standard]>=0.40.0",
+    "websockets>=16.0",
 ]
 
 [tool.uv]
@@ -24,4 +32,4 @@ default = true
 
 
 [tool.setuptools.packages.find]
-include = ["cs336_basics"]
+include = ["cs336_scaling", "hyperturing"]
