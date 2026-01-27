@@ -1,6 +1,9 @@
 import asyncio
 import logging
 import os
+import signal
+import subprocess
+import sys
 from functools import lru_cache
 from typing import Any, Dict
 
@@ -13,10 +16,12 @@ from .database import Database
 from .trainer import Trainer
 
 # Setup logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Hyperturing Server")
+app = FastAPI(title="Hyperturing Server (Reliability Grade)")
 
 # Configuration
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -26,9 +31,10 @@ SCALING_LAWS_BUDGET = 2e18
 DEFAULT_VOCAB_SIZE = 32000
 CONTEXT_LENGTH = 512
 
-# Global state for monitoring
-# Map of job_id -> mp.Queue
+# Global state
 active_queues: Dict[str, mp.Queue] = {}
+training_lock = asyncio.Lock()
+app_state = {"is_running": True}
 
 
 @lru_cache()
@@ -49,9 +55,89 @@ def get_trainer():
 
 
 def get_job_id(api_key: str, config: Dict[str, Any]) -> str:
-    """Generate a unique ID for a training job."""
     config_str = f"{config['d_model']}_{config['num_layers']}_{config['num_heads']}_{config['batch_size']}_{config['learning_rate']}_{config['train_flops']}"
     return f"{api_key}_{config_str}"
+
+
+def get_npu_stats():
+    """Extract NPU usage information by parsing npu-smi info."""
+    try:
+        # Run npu-smi info and capture output
+        res = subprocess.check_output(["npu-smi", "info"], encoding="utf-8")
+        lines = res.splitlines()
+
+        # Searching for the memory usage line.
+        # Output format has columns: NPU, Name, Health, Power, Temp, Hugepages, Chip, Bus-Id, AICore, Memory, HBM
+        # We look for the line containing HBM-Usage or Memory-Usage values.
+        hbm_info = "N/A"
+        health = "Unknown"
+
+        for i, line in enumerate(lines):
+            if "OK" in line:
+                health = "OK"
+            if "/" in line and ("65536" in line or "32768" in line):
+                # This is likely the line with memory usage (e.g., "3391 / 65536")
+                # We can extract the HBM usage part
+                parts = [p.strip() for p in line.split("|") if p.strip()]
+                if len(parts) >= 5:
+                    hbm_info = parts[4]  # 5th column for HBM usage in Summary view
+
+        return {
+            "health": health,
+            "hbm_usage": hbm_info,
+            "lock_active": training_lock.locked(),
+        }
+    except Exception as e:
+        logger.debug(f"Failed to parse npu-smi: {e}")
+        return {"health": "error", "error": str(e)}
+
+
+@app.get("/health")
+async def health_check():
+    """Industrial grade health check for load balancer or monitor."""
+    stats = get_npu_stats()
+    return {
+        "status": "UP" if stats.get("health") == "OK" else "DEGRADED",
+        "npu": stats,
+        "database": "OK" if os.path.exists(DB_PATH) else "CRITICAL",
+    }
+
+
+async def guardian_task():
+    """Background task to ensure system health and resource cleanup."""
+    logger.info("Guardian task started.")
+    while app_state["is_running"]:
+        try:
+            # Check for orphaned processes or unexpected memory bloat
+            # On NPU/GPU, clearing cache periodically when idle can help
+            if not training_lock.locked():
+                compat.empty_cache()
+
+            # Additional health checks could go here
+            await asyncio.sleep(60)
+        except Exception as e:
+            logger.error(f"Error in Guardian task: {e}")
+            await asyncio.sleep(10)
+
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(guardian_task())
+
+    # Handle signals for graceful shutdown
+    def signal_handler():
+        logger.info("Shutdown signal received.")
+        app_state["is_running"] = False
+        # In a real service, we'd wait for training to finish or kill it
+        sys.exit(0)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop = asyncio.get_event_loop()
+            loop.add_signal_handler(sig, signal_handler)
+        except NotImplementedError:
+            # Not supported on Windows, but this is Linux
+            pass
 
 
 @app.get("/loss")
@@ -61,7 +147,7 @@ async def get_loss(
     num_heads: int,
     batch_size: int,
     learning_rate: float,
-    train_flops: float,  # Changed to float for safety with 1e13 notation
+    train_flops: float,
     api_key: str,
 ):
     # Validation
@@ -132,42 +218,70 @@ async def get_loss(
 
     job_id = get_job_id(api_key, config)
 
-    # Check database first
+    # Check for existing successful run
     existing_loss = db.get_existing_run(api_key, config)
     if existing_loss is not None:
         total_used = db.get_total_flops(api_key)
         return {"loss": existing_loss, "total_flops_used": total_used}
 
+    # Budget Check
     current_used = db.get_total_flops(api_key) or 0.0
     if current_used + train_flops > SCALING_LAWS_BUDGET:
         raise HTTPException(status_code=403, detail="Scaling laws budget exceeded")
 
-    # Handle concurrency: if a job is already running, wait for it?
-    # For now, we'll just run it. The mp.spawn handles its own processes.
+    # Initialize Job Tracking
+    run_id = db.initialize_run(api_key, config)
 
-    ctx = mp.get_context("spawn")
-    progress_queue = ctx.Queue()
-    active_queues[job_id] = progress_queue
+    # 5. Serialize Execution using a Lock
+    # Only one training job can run at a time to prevent OOM
+    logger.info(f"Job {job_id} (run_id: {run_id}) waiting for NPU lock...")
 
-    try:
-        # run_in_threadpool allows the server to handle other requests (like WS) while training
-        loss = await run_in_threadpool(trainer.train, config, progress_queue)
+    async def run_training():
+        async with training_lock:
+            # Double check inside the lock for existing results (prevents redundant work from near-simultaneous requests)
+            existing_loss = db.get_existing_run(api_key, config)
+            if existing_loss is not None:
+                total_used = db.get_total_flops(api_key)
+                logger.info(
+                    f"Job {job_id} found existing result in DB after acquiring lock. Skipping."
+                )
+                return {"loss": existing_loss, "total_flops_used": total_used}
 
-        db.record_run(api_key, config, loss)
-        db.update_total_flops(api_key, float(train_flops))
-        new_total_used = db.get_total_flops(api_key)
-        return {"loss": loss, "total_flops_used": new_total_used}
-    except Exception as e:
-        logger.error(f"Training failed: {e}")
-        raise HTTPException(
-            status_code=500, detail=f"Internal training error: {str(e)}"
-        )
-    finally:
-        # Clean up queue after job finishes
-        if job_id in active_queues:
-            del active_queues[job_id]
-        # Explicitly clear cache in the server process just in case
-        compat.empty_cache()
+            logger.info(f"Job {job_id} acquired NPU lock. Starting training.")
+            db.update_run_status(run_id, "RUNNING")
+
+            ctx = mp.get_context("spawn")
+            progress_queue = ctx.Queue()
+            active_queues[job_id] = progress_queue
+
+            try:
+                # Run training in worker process via mp.spawn
+                loss = await run_in_threadpool(trainer.train, config, progress_queue)
+
+                # Record success
+                db.update_run_status(run_id, "SUCCESS", loss=loss)
+                db.update_total_flops(api_key, float(train_flops))
+                new_total_used = db.get_total_flops(api_key)
+                logger.info(f"Job {job_id} completed successfully. Loss: {loss}")
+                return {"loss": loss, "total_flops_used": new_total_used}
+
+            except Exception as e:
+                error_msg = str(e)
+                clean_error = (
+                    "NPU out of memory"
+                    if "out of memory" in error_msg.lower()
+                    else error_msg
+                )
+                logger.error(f"Job {job_id} failed: {error_msg}")
+                db.update_run_status(run_id, "FAILED", error_message=clean_error)
+                raise HTTPException(status_code=500, detail=clean_error)
+            finally:
+                if job_id in active_queues:
+                    del active_queues[job_id]
+                compat.empty_cache()
+
+    # Use shield to ensure training completes even if client disconnects
+    return await asyncio.shield(run_training())
 
 
 @app.websocket("/loss_ws")
@@ -176,12 +290,7 @@ async def websocket_endpoint(websocket: WebSocket, api_key: str):
     logger.info(f"WebSocket connected for API key: {api_key}")
 
     try:
-        while True:
-            # We need to identify which job the user wants to monitor.
-            # For simplicity, we'll monitor the "latest" or "active" job for this API key.
-            # In a more complex setup, the client could send a job_id.
-
-            # Find an active queue for this API key
+        while app_state["is_running"]:
             target_job_id = None
             for jid in active_queues.keys():
                 if jid.startswith(api_key):
@@ -191,15 +300,23 @@ async def websocket_endpoint(websocket: WebSocket, api_key: str):
             if target_job_id:
                 queue = active_queues[target_job_id]
                 try:
-                    # Non-blocking get from queue
                     data = queue.get_nowait()
+                    # Add system health info to WebSocket push
+                    data["sys_npu"] = get_npu_stats()
                     await websocket.send_json(data)
-                except:  # noqa: E722
-                    # No data yet, wait a bit
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
                     await asyncio.sleep(0.5)
             else:
-                # No active job, just wait
-                await asyncio.sleep(1.0)
+                # Optionally send heartbeat with system stats
+                await asyncio.sleep(2.0)
+                try:
+                    await websocket.send_json(
+                        {"heartbeat": True, "sys_npu": get_npu_stats()}
+                    )
+                except Exception:
+                    break
 
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected for API key: {api_key}")

@@ -133,8 +133,8 @@ def train_worker(
             data, local_batch_size, context_length, cpu_generator, device, num_steps
         )
 
-        # Rationalize logging frequency: target ~10 logs per run
-        log_interval = max(1, num_steps // 10)
+        # Rationalize logging frequency: target ~16 logs per run
+        log_interval = max(1, num_steps // 16)
 
         for step in range(num_steps):
             x, y = prefetcher.next()
