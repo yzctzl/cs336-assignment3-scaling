@@ -77,16 +77,14 @@ def run_sweep():
     # Iterate through unique configs in CSV
     for _, row in df_sweep.iterrows():
         c = float(row["Budget"])
-        n_target = float(row["Group_Center_N"])
+        n_target = float(row["Besiroglu_N_Opt"])
         lr = float(row["LR"])
 
         config = {
             "d_model": int(row["d_model"]),
             "num_layers": int(row["layers"]),
             "num_heads": int(row["heads"]),
-            "batch_size": 128
-            if row["layers"] < 10
-            else 64,  # Adaptive BS to prevent OOM
+            "batch_size": 128,
             "learning_rate": lr,
             "train_flops": int(c),
             "api_key": API_KEY,

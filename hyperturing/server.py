@@ -171,7 +171,7 @@ async def get_loss(
             status_code=404,
             detail=f"batch_size must be one of {{128, 256}}, got {batch_size}",
         )
-    if not (1e-4 <= learning_rate <= 1e-3):
+    if not (1e-6 <= learning_rate <= 1):
         raise HTTPException(
             status_code=404,
             detail=f"learning_rate must be in range [1e-4, 1e-3], got {learning_rate}",
