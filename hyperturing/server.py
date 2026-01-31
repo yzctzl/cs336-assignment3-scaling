@@ -2,13 +2,13 @@ import asyncio
 import logging
 import os
 import signal
-import subprocess
 import sys
+from contextlib import asynccontextmanager
 from functools import lru_cache
-from typing import Any, Dict
+from typing import Any, Dict, Literal
 
 import torch.multiprocessing as mp
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException
 from starlette.concurrency import run_in_threadpool
 
 from .compat import compat
@@ -21,20 +21,52 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Hyperturing Server (Reliability Grade)")
-
 # Configuration
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_PATH = "data/sp6/tinypajama.npy"
+
+DataSet = {
+    "tss": {"path": "data/tss/TinyStoriesV2-GPT4-train.npy", "size": 10000,},  # vocab size
+    "256": {"path": "data/tss/TinyStoriesV2-GPT4-train_256.npy", "size": 256},  # only for low budget
+    "owt": {"path": "data/owt/owt_train.npy", "size": 32000,},
+    "sp6": {"path": "data/sp6/tinypajama.npy", "size": 32000},
+}
+
 DB_PATH = os.path.join(BASE_DIR, "db", "hyperturing.db")
 SCALING_LAWS_BUDGET = 2e18
-DEFAULT_VOCAB_SIZE = 32000
 CONTEXT_LENGTH = 512
 
 # Global state
 active_queues: Dict[str, mp.Queue] = {}
 training_lock = asyncio.Lock()
 app_state = {"is_running": True}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Start background tasks
+    asyncio.create_task(guardian_task())
+
+    # Handle signals for graceful shutdown
+    def signal_handler():
+        logger.info("Shutdown signal received.")
+        app_state["is_running"] = False
+        # In a real service, we'd wait for training to finish or kill it
+        sys.exit(0)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop = asyncio.get_event_loop()
+            loop.add_signal_handler(sig, signal_handler)
+        except NotImplementedError:
+            # Not supported on Windows, but this is Linux
+            pass
+
+    yield
+    # Shutdown: Clean up if necessary
+    app_state["is_running"] = False
+
+
+app = FastAPI(title="Hyperturing Server", lifespan=lifespan)
 
 
 @lru_cache()
@@ -44,63 +76,18 @@ def get_db():
 
 
 @lru_cache()
-def get_trainer():
-    path = DATA_PATH
-    vocab_size = DEFAULT_VOCAB_SIZE
-    if not os.path.exists(path):
-        logger.warning(f"Data not found at {path}, falling back to OpenWebText")
-        path = "data/owt/owt_train.npy"
-        vocab_size = 32000
+def get_trainer(dataset):
+    path = DataSet[dataset]["path"]
+    vocab_size = DataSet[dataset]["size"]
     return Trainer(path, vocab_size=vocab_size, context_length=CONTEXT_LENGTH)
 
 
 def get_job_id(api_key: str, config: Dict[str, Any]) -> str:
     config_str = f"{config['d_model']}_{config['num_layers']}_{config['num_heads']}_{config['batch_size']}_{config['learning_rate']}_{config['train_flops']}"
+    # Backward compatibility: only append vocab_size if it's not the default 10000
+    if config.get("vocab_size", 32000) < 10000:
+        config_str += f"_{config['vocab_size']}"
     return f"{api_key}_{config_str}"
-
-
-def get_npu_stats():
-    """Extract NPU usage information by parsing npu-smi info."""
-    try:
-        # Run npu-smi info and capture output
-        res = subprocess.check_output(["npu-smi", "info"], encoding="utf-8")
-        lines = res.splitlines()
-
-        # Searching for the memory usage line.
-        # Output format has columns: NPU, Name, Health, Power, Temp, Hugepages, Chip, Bus-Id, AICore, Memory, HBM
-        # We look for the line containing HBM-Usage or Memory-Usage values.
-        hbm_info = "N/A"
-        health = "Unknown"
-
-        for i, line in enumerate(lines):
-            if "OK" in line:
-                health = "OK"
-            if "/" in line and ("65536" in line or "32768" in line):
-                # This is likely the line with memory usage (e.g., "3391 / 65536")
-                # We can extract the HBM usage part
-                parts = [p.strip() for p in line.split("|") if p.strip()]
-                if len(parts) >= 5:
-                    hbm_info = parts[4]  # 5th column for HBM usage in Summary view
-
-        return {
-            "health": health,
-            "hbm_usage": hbm_info,
-            "lock_active": training_lock.locked(),
-        }
-    except Exception as e:
-        logger.debug(f"Failed to parse npu-smi: {e}")
-        return {"health": "error", "error": str(e)}
-
-
-@app.get("/health")
-async def health_check():
-    """Industrial grade health check for load balancer or monitor."""
-    stats = get_npu_stats()
-    return {
-        "status": "UP" if stats.get("health") == "OK" else "DEGRADED",
-        "npu": stats,
-        "database": "OK" if os.path.exists(DB_PATH) else "CRITICAL",
-    }
 
 
 async def guardian_task():
@@ -120,26 +107,6 @@ async def guardian_task():
             await asyncio.sleep(10)
 
 
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(guardian_task())
-
-    # Handle signals for graceful shutdown
-    def signal_handler():
-        logger.info("Shutdown signal received.")
-        app_state["is_running"] = False
-        # In a real service, we'd wait for training to finish or kill it
-        sys.exit(0)
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop = asyncio.get_event_loop()
-            loop.add_signal_handler(sig, signal_handler)
-        except NotImplementedError:
-            # Not supported on Windows, but this is Linux
-            pass
-
-
 @app.get("/loss")
 async def get_loss(
     d_model: int,
@@ -149,9 +116,10 @@ async def get_loss(
     learning_rate: float,
     train_flops: float,
     api_key: str,
+    dataset: Literal["tss", "256", "owt", "sp6"] = "sp6",
 ):
     # Validation
-    if not (64 <= d_model <= 1024):
+    if not (8 <= d_model <= 1024):
         raise HTTPException(
             status_code=404,
             detail=f"d_model must be in range [64, 1024], got {d_model}",
@@ -203,7 +171,7 @@ async def get_loss(
             )
 
     db = get_db()
-    trainer = get_trainer()
+    trainer = get_trainer(dataset)
     db.add_api_key(api_key)
 
     config = {
@@ -229,12 +197,9 @@ async def get_loss(
     if current_used + train_flops > SCALING_LAWS_BUDGET:
         raise HTTPException(status_code=403, detail="Scaling laws budget exceeded")
 
-    # Initialize Job Tracking
-    run_id = db.initialize_run(api_key, config)
-
     # 5. Serialize Execution using a Lock
     # Only one training job can run at a time to prevent OOM
-    logger.info(f"Job {job_id} (run_id: {run_id}) waiting for NPU lock...")
+    logger.info(f"Job {job_id} waiting for NPU lock...")
 
     async def run_training():
         async with training_lock:
@@ -247,7 +212,11 @@ async def get_loss(
                 )
                 return {"loss": existing_loss, "total_flops_used": total_used}
 
-            logger.info(f"Job {job_id} acquired NPU lock. Starting training.")
+            # Initialize Job Tracking under lock to avoid orphaned PENDING records
+            run_id = db.initialize_run(api_key, config)
+            logger.info(
+                f"Job {job_id} (run_id: {run_id}) acquired NPU lock. Starting training."
+            )
             db.update_run_status(run_id, "RUNNING")
 
             ctx = mp.get_context("spawn")
@@ -282,46 +251,6 @@ async def get_loss(
 
     # Use shield to ensure training completes even if client disconnects
     return await asyncio.shield(run_training())
-
-
-@app.websocket("/loss_ws")
-async def websocket_endpoint(websocket: WebSocket, api_key: str):
-    await websocket.accept()
-    logger.info(f"WebSocket connected for API key: {api_key}")
-
-    try:
-        while app_state["is_running"]:
-            target_job_id = None
-            for jid in active_queues.keys():
-                if jid.startswith(api_key):
-                    target_job_id = jid
-                    break
-
-            if target_job_id:
-                queue = active_queues[target_job_id]
-                try:
-                    data = queue.get_nowait()
-                    # Add system health info to WebSocket push
-                    data["sys_npu"] = get_npu_stats()
-                    await websocket.send_json(data)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    await asyncio.sleep(0.5)
-            else:
-                # Optionally send heartbeat with system stats
-                await asyncio.sleep(2.0)
-                try:
-                    await websocket.send_json(
-                        {"heartbeat": True, "sys_npu": get_npu_stats()}
-                    )
-                except Exception:
-                    break
-
-    except WebSocketDisconnect:
-        logger.info(f"WebSocket disconnected for API key: {api_key}")
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
 
 
 @app.get("/total_flops_used")

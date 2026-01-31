@@ -49,46 +49,42 @@ def get_optimal_n_besiroglu(compute_budget):
 
 def get_model_registry():
     candidates = []
-    for d in range(64, 1025, 32):
-        for l in range(2, 25, 1):  # noqa: E741
-            valid_heads = [h for h in [2, 4, 8, 16] if d % h == 0]
-            if not valid_heads:
-                continue
-            h = max(valid_heads)
+    # 1. 重点覆盖区：d 在 32 到 256 之间，步长设小以提高 U 型底分辨率
+    for d in [32, 48, 64, 80, 96, 128, 160, 192, 224, 256]:
+        for l in [2, 3, 4, 6, 8, 12]:
             n_params = 12 * l * (d**2)
-            ratio = d / l
-            if ratio < 10 or ratio > 200:
-                continue
-            candidates.append(
-                {
-                    "n_params": n_params,
-                    "d_model": d,
-                    "num_layers": l,
-                    "num_heads": h,
-                    "batch_size": 128,
-                }
-            )
-    return pd.DataFrame(candidates).sort_values("n_params").reset_index(drop=True)
+            candidates.append({
+                "n_params": n_params, "d_model": d, "num_layers": l, "num_heads": 4 if d < 128 else 8
+            })
+
+    # 2. 扩展区：覆盖更高算力下的最优 N
+    for d in [320, 384, 448, 512]:
+        for l in [4, 8, 12, 16, 20]:
+            n_params = 12 * l * (d**2)
+            candidates.append({
+                "n_params": n_params, "d_model": d, "num_layers": l, "num_heads": 16
+            })
+            
+    df = pd.DataFrame(candidates).drop_duplicates(subset=['n_params'])
+    return df.sort_values("n_params").reset_index(drop=True)
 
 
 # 3. 扫描策略 (重点关注低算力区的 Range)
 schedule = [
-    # Low Compute: 必须把范围拉大，找到 U 型
-    {"C": 1e13, "Range": [0.25, 4.0], "N_Models": 6, "LR_Points": 5},
-    {"C": 3e13, "Range": [0.25, 4.0], "N_Models": 7, "LR_Points": 5},
-    {"C": 6e13, "Range": [0.25, 4.0], "N_Models": 7, "LR_Points": 5},
-    {"C": 1e14, "Range": [0.3, 3.5], "N_Models": 7, "LR_Points": 5},
-    {"C": 3e14, "Range": [0.3, 3.5], "N_Models": 7, "LR_Points": 5},
-    # Mid/High Compute (这些通常比较正常，但也应用新函数)
-    {"C": 6e14, "Range": [0.3, 3.5], "N_Models": 7, "LR_Points": 5},
-    {"C": 1e15, "Range": [0.4, 2.5], "N_Models": 7, "LR_Points": 5},
-    {"C": 3e15, "Range": [0.4, 2.5], "N_Models": 7, "LR_Points": 5},
-    {"C": 6e15, "Range": [0.4, 2.5], "N_Models": 7, "LR_Points": 5},
-    # High Compute (逐渐收敛)
-    {"C": 1e16, "Range": [0.5, 2.0], "N_Models": 6, "LR_Points": 3},
-    {"C": 3e16, "Range": [0.6, 1.8], "N_Models": 5, "LR_Points": 2},
-    {"C": 6e16, "Range": [0.6, 1.8], "N_Models": 5, "LR_Points": 2},
-    {"C": 1e17, "Range": [0.7, 1.5], "N_Models": 5, "LR_Points": 1},
+    # Low Compute: 之前的实验证明 1e13 的底在 100K 附近
+    # 我们从 0.1 开始扫 (约 22K)，绝对能看到左侧 Loss 上升
+    {"C": 1e13, "Range": [0.1, 3.0],  "N_Models": 8, "LR_Points": 5},
+    {"C": 3e13, "Range": [0.1, 3.0],  "N_Models": 9, "LR_Points": 5},
+    {"C": 1e14, "Range": [0.15, 3.5], "N_Models": 9, "LR_Points": 5},
+    
+    # Mid Compute: 理论最优 N 增加，Range 跟随平移
+    {"C": 3e14, "Range": [0.2, 4.0],  "N_Models": 9, "LR_Points": 5},
+    {"C": 6e14, "Range": [0.25, 4.0], "N_Models": 8, "LR_Points": 5},
+    
+    # High Compute: 逐步减少模型数量，增加预测的可信度
+    # {"C": 1e15, "Range": [0.4, 3.0],  "N_Models": 8, "LR_Points": 5},
+    # {"C": 5e15, "Range": [0.5, 2.5],  "N_Models": 7, "LR_Points": 3},
+    # {"C": 1e16, "Range": [0.6, 2.0],  "N_Models": 6, "LR_Points": 2},
 ]
 
 # 4. 生成计划

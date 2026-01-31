@@ -1,4 +1,4 @@
-# pyright: reportAttributeAccessIssue=none
+import functools
 import logging
 import os
 import socket
@@ -16,9 +16,10 @@ from torch.distributed.fsdp import (
     MixedPrecision,
     ShardingStrategy,
 )
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.types import Tensor
 
-from cs336_scaling.model import BasicsTransformerLM
+from cs336_scaling.model import BasicsTransformerLM, TransformerBlock
 
 from .compat import DEVICE_TYPE, compat
 from .dataload import DataPrefetcher
@@ -92,9 +93,15 @@ def train_worker(
 
         if world_size > 1:
             # FSDP for maximizing model size
+            # Use auto_wrap_policy for proper communication-computation overlap!
+            # Without this, the entire model is one FSDP unit, blocking all comms.
             model = FSDP(
                 model,
                 sharding_strategy=ShardingStrategy.FULL_SHARD,
+                auto_wrap_policy=functools.partial(
+                    transformer_auto_wrap_policy,
+                    transformer_layer_cls={TransformerBlock},
+                ),
                 mixed_precision=MixedPrecision(
                     param_dtype=torch.float16,
                     reduce_dtype=torch.float16,
@@ -114,7 +121,7 @@ def train_worker(
         if num_steps <= 0:
             num_steps = 1
 
-        data = np.load(train_data_path, mmap_mode="r")
+        data = np.load(train_data_path)
 
         cpu_generator = torch.Generator(device="cpu")
         cpu_generator.manual_seed(42 + rank)
@@ -151,24 +158,21 @@ def train_worker(
             optimizer.step()
             scheduler.step()
 
-            last_loss = loss.item()
-
-            if rank == 0:
-                if (step + 1) % log_interval == 0 or step == num_steps - 1:
-                    logger.info(
-                        f"[Rank 0] Step {step + 1}/{num_steps}, Loss: {last_loss:.4f}"
+            if rank == 0 and ((step + 1) % log_interval == 0 or step == num_steps - 1):
+                last_loss = loss.item()
+                return_dict[0] = last_loss
+                logger.info(
+                    f"[Rank 0] Step {step + 1}/{num_steps}, Loss: {last_loss:.4f}"
+                )
+                if progress_queue:
+                    progress_queue.put(
+                        {
+                            "step": step + 1,
+                            "total_steps": num_steps,
+                            "loss": last_loss,
+                        }
                     )
-                    if progress_queue:
-                        progress_queue.put(
-                            {
-                                "step": step + 1,
-                                "total_steps": num_steps,
-                                "loss": last_loss,
-                            }
-                        )
 
-        if rank == 0:
-            return_dict[0] = last_loss
     except Exception as e:
         logger.error(f"Error in train_worker rank {rank}: {e}")
         raise e

@@ -40,15 +40,11 @@ class DataPrefetcher:
         )
 
         ix_np = ix.numpy()
-        x_np = np.stack(
-            [self.data[i : i + self.context_length].astype(np.int64) for i in ix_np]
-        )
-        y_np = np.stack(
-            [
-                self.data[i + 1 : i + self.context_length + 1].astype(np.int64)
-                for i in ix_np
-            ]
-        )
+        # Vectorized slicing: (B, 1) + (1, L) -> (B, L) indexing
+        # This is much faster than list comprehension + stack when data is in RAM
+        indices = ix_np[:, None] + np.arange(self.context_length)[None, :]
+        x_np = self.data[indices].astype(np.int64)
+        y_np = self.data[indices + 1].astype(np.int64)
 
         tx = torch.from_numpy(x_np)
         ty = torch.from_numpy(y_np)
