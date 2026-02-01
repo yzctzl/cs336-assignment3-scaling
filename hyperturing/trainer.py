@@ -2,6 +2,7 @@ import functools
 import logging
 import os
 import socket
+from multiprocessing import shared_memory
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -52,6 +53,7 @@ def train_worker(
     port: str,
     config: Dict[str, Any],
     train_data_path: str,
+    shm_info: Optional[Dict[str, Any]],
     vocab_size: int,
     context_length: int,
     return_dict: Dict[int, float],
@@ -59,6 +61,7 @@ def train_worker(
 ):
     model: Optional[nn.Module] = None
     optimizer: Optional[torch.optim.Optimizer] = None
+    shm = None
     try:
         if world_size > 1:
             setup_distributed(rank, world_size, port)
@@ -121,7 +124,22 @@ def train_worker(
         if num_steps <= 0:
             num_steps = 1
 
-        data = np.load(train_data_path)
+        # Shared Memory / Direct Memory Loading
+        data = None
+        shm = None
+        if shm_info:
+            try:
+                shm = shared_memory.SharedMemory(name=shm_info["name"])
+                data = np.ndarray(
+                    shm_info["shape"], dtype=shm_info["dtype"], buffer=shm.buf
+                )
+                logger.info(f"Attached to SharedMemory: {shm_info['name']}")
+            except Exception as e:
+                logger.error(f"Failed to attach to SharedMemory: {e}")
+                # Fallback to disk load if SHM fails
+                data = np.load(train_data_path)
+        else:
+            data = np.load(train_data_path)
 
         cpu_generator = torch.Generator(device="cpu")
         cpu_generator.manual_seed(42 + rank)
@@ -184,16 +202,23 @@ def train_worker(
             del model
         if "optimizer" in locals():
             del optimizer
+        if "shm" in locals() and shm is not None:
+            shm.close()
         compat.empty_cache()
 
 
 class Trainer:
     def __init__(
-        self, train_data_path: str, vocab_size: int = 32000, context_length: int = 512
+        self,
+        train_data_path: str,
+        vocab_size: int = 32000,
+        context_length: int = 512,
+        shm_info: Optional[Dict[str, Any]] = None,
     ):
         self.train_data_path = train_data_path
         self.vocab_size = vocab_size
         self.context_length = context_length
+        self.shm_info = shm_info
         self.world_size = compat.device_count()
         if self.world_size == 0:
             self.world_size = 1
@@ -222,6 +247,7 @@ class Trainer:
                     port,
                     config,
                     self.train_data_path,
+                    self.shm_info,
                     vocab_size,
                     context_length,
                     return_dict,

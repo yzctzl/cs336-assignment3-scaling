@@ -5,8 +5,10 @@ import signal
 import sys
 from contextlib import asynccontextmanager
 from functools import lru_cache
+from multiprocessing import shared_memory
 from typing import Any, Dict, Literal
 
+import numpy as np
 import torch.multiprocessing as mp
 from fastapi import FastAPI, HTTPException
 from starlette.concurrency import run_in_threadpool
@@ -25,9 +27,18 @@ logger = logging.getLogger(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DataSet = {
-    "tss": {"path": "data/tss/TinyStoriesV2-GPT4-train.npy", "size": 10000,},  # vocab size
-    "256": {"path": "data/tss/TinyStoriesV2-GPT4-train_256.npy", "size": 256},  # only for low budget
-    "owt": {"path": "data/owt/owt_train.npy", "size": 32000,},
+    "tss": {
+        "path": "data/tss/TinyStoriesV2-GPT4-train.npy",
+        "size": 10000,
+    },  # vocab size
+    "256": {
+        "path": "data/tss/TinyStoriesV2-GPT4-train_256.npy",
+        "size": 256,
+    },  # only for low budget
+    "owt": {
+        "path": "data/owt/owt_train.npy",
+        "size": 32000,
+    },
     "sp6": {"path": "data/sp6/tinypajama.npy", "size": 32000},
 }
 
@@ -38,19 +49,73 @@ CONTEXT_LENGTH = 512
 # Global state
 active_queues: Dict[str, mp.Queue] = {}
 training_lock = asyncio.Lock()
-app_state = {"is_running": True}
+app_state = {
+    "is_running": True,
+    "shm_map": {},  # dataset_key -> {shm_name, shape, dtype, _ref}
+}
+dataset_loading_lock = asyncio.Lock()
+
+
+async def ensure_dataset_loaded(dataset: str):
+    """Lazy loads dataset into SharedMemory if not already present."""
+    if dataset not in DataSet:
+        logger.error(f"Unknown dataset requested: {dataset}")
+        return
+
+    # Check if already loaded
+    if dataset in app_state["shm_map"]:
+        return
+
+    async with dataset_loading_lock:
+        # Double-check inside lock
+        if dataset in app_state["shm_map"]:
+            return
+
+        info = DataSet[dataset]
+        data_path = info["path"]
+        if not os.path.exists(data_path):
+            logger.error(f"Dataset {dataset} not found at {data_path}")
+            return
+
+        try:
+            logger.info(f"Lazy loading dataset {dataset} from {data_path} into RAM...")
+            # Run blocking IO in threadpool to avoid blocking event loop
+            raw_data = await run_in_threadpool(np.load, data_path)
+
+            # Create SHM (must be done in main process/thread generally safe if managed correctly)
+            # np.load might be heavy, so we awaited it. SHM creation is fast.
+            shm = shared_memory.SharedMemory(create=True, size=raw_data.nbytes)
+            shared_arr = np.ndarray(
+                raw_data.shape, dtype=raw_data.dtype, buffer=shm.buf
+            )
+            shared_arr[:] = raw_data[:]
+
+            app_state["shm_map"][dataset] = {
+                "name": shm.name,
+                "shape": raw_data.shape,
+                "dtype": raw_data.dtype,
+                "_ref": shm,
+            }
+            logger.info(
+                f"Dataset {dataset} successfully loaded into SharedMemory: {shm.name}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to lazy load dataset {dataset}: {e}")
+            # Ensure we don't leave broken state or leaks?
+            if "shm" in locals() and "shm" not in app_state["shm_map"].values():
+                shm.close()  # pyright: ignore[reportPossiblyUnboundVariable]
+                shm.unlink()  # pyright: ignore[reportPossiblyUnboundVariable]
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Start background tasks
+    # Startup: Background tasks
     asyncio.create_task(guardian_task())
 
     # Handle signals for graceful shutdown
     def signal_handler():
         logger.info("Shutdown signal received.")
         app_state["is_running"] = False
-        # In a real service, we'd wait for training to finish or kill it
         sys.exit(0)
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -58,12 +123,18 @@ async def lifespan(app: FastAPI):
             loop = asyncio.get_event_loop()
             loop.add_signal_handler(sig, signal_handler)
         except NotImplementedError:
-            # Not supported on Windows, but this is Linux
             pass
 
     yield
-    # Shutdown: Clean up if necessary
+    # Shutdown: Clean up
     app_state["is_running"] = False
+    for key, info in app_state["shm_map"].items():
+        try:
+            info["_ref"].close()
+            info["_ref"].unlink()
+            logger.info(f"SharedMemory for {key} cleaned up.")
+        except Exception as e:
+            logger.error(f"Error cleaning up SHM for {key}: {e}")
 
 
 app = FastAPI(title="Hyperturing Server", lifespan=lifespan)
@@ -77,9 +148,23 @@ def get_db():
 
 @lru_cache()
 def get_trainer(dataset):
+    # Retrieve SHM info from global state if available
+    shm_info = None
+    if dataset in app_state["shm_map"]:
+        entry = app_state["shm_map"][dataset]
+        shm_info = {
+            "name": entry["name"],
+            "shape": entry["shape"],
+            "dtype": entry["dtype"],
+        }
     path = DataSet[dataset]["path"]
     vocab_size = DataSet[dataset]["size"]
-    return Trainer(path, vocab_size=vocab_size, context_length=CONTEXT_LENGTH)
+    return Trainer(
+        path,
+        vocab_size=vocab_size,
+        context_length=CONTEXT_LENGTH,
+        shm_info=shm_info,
+    )
 
 
 def get_job_id(api_key: str, config: Dict[str, Any]) -> str:
@@ -169,6 +254,9 @@ async def get_loss(
                 status_code=404,
                 detail=f"train_flops must be one of {valid_flops}, got {train_flops}",
             )
+
+    # Ensure data is loaded into SHM before creating trainer or running job
+    await ensure_dataset_loaded(dataset)
 
     db = get_db()
     trainer = get_trainer(dataset)

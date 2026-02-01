@@ -51,21 +51,26 @@ def get_model_registry():
     candidates = []
     # 1. 重点覆盖区：d 在 32 到 256 之间，步长设小以提高 U 型底分辨率
     for d in [32, 48, 64, 80, 96, 128, 160, 192, 224, 256]:
-        for l in [2, 3, 4, 6, 8, 12]:
+        for l in [2, 3, 4, 6, 8, 12]:  # noqa: E741
             n_params = 12 * l * (d**2)
-            candidates.append({
-                "n_params": n_params, "d_model": d, "num_layers": l, "num_heads": 4 if d < 128 else 8
-            })
+            candidates.append(
+                {
+                    "n_params": n_params,
+                    "d_model": d,
+                    "num_layers": l,
+                    "num_heads": 4 if d < 128 else 8,
+                }
+            )
 
     # 2. 扩展区：覆盖更高算力下的最优 N
     for d in [320, 384, 448, 512]:
-        for l in [4, 8, 12, 16, 20]:
+        for l in [4, 8, 12, 16, 20]:  # noqa: E741
             n_params = 12 * l * (d**2)
-            candidates.append({
-                "n_params": n_params, "d_model": d, "num_layers": l, "num_heads": 16
-            })
-            
-    df = pd.DataFrame(candidates).drop_duplicates(subset=['n_params'])
+            candidates.append(
+                {"n_params": n_params, "d_model": d, "num_layers": l, "num_heads": 16}
+            )
+
+    df = pd.DataFrame(candidates).drop_duplicates(subset=["n_params"])
     return df.sort_values("n_params").reset_index(drop=True)
 
 
@@ -73,14 +78,12 @@ def get_model_registry():
 schedule = [
     # Low Compute: 之前的实验证明 1e13 的底在 100K 附近
     # 我们从 0.1 开始扫 (约 22K)，绝对能看到左侧 Loss 上升
-    {"C": 1e13, "Range": [0.1, 3.0],  "N_Models": 8, "LR_Points": 5},
-    {"C": 3e13, "Range": [0.1, 3.0],  "N_Models": 9, "LR_Points": 5},
+    {"C": 1e13, "Range": [0.1, 3.0], "N_Models": 8, "LR_Points": 5},
+    {"C": 3e13, "Range": [0.1, 3.0], "N_Models": 9, "LR_Points": 5},
     {"C": 1e14, "Range": [0.15, 3.5], "N_Models": 9, "LR_Points": 5},
-    
     # Mid Compute: 理论最优 N 增加，Range 跟随平移
-    {"C": 3e14, "Range": [0.2, 4.0],  "N_Models": 9, "LR_Points": 5},
+    {"C": 3e14, "Range": [0.2, 4.0], "N_Models": 9, "LR_Points": 5},
     {"C": 6e14, "Range": [0.25, 4.0], "N_Models": 8, "LR_Points": 5},
-    
     # High Compute: 逐步减少模型数量，增加预测的可信度
     # {"C": 1e15, "Range": [0.4, 3.0],  "N_Models": 8, "LR_Points": 5},
     # {"C": 5e15, "Range": [0.5, 2.5],  "N_Models": 7, "LR_Points": 3},
@@ -135,6 +138,7 @@ for stage in schedule:
                     "layers": int(model["num_layers"]),
                     "heads": int(model["num_heads"]),
                     "LR": lr,
+                    "dataset": "256",
                     "Cost_Val": f"{budget:.0e}",
                 }
             )

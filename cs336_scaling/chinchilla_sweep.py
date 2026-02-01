@@ -55,17 +55,12 @@ def get_loss(config: Dict[str, Any], poll_interval: int = 30) -> float:
             return float("nan")
 
 
-def chinchilla_model(X, E, A, B, alpha, beta):
-    N, D = X
-    return E + A / (N**alpha) + B / (D**beta)
-
-
 def run_sweep():
     if not os.path.exists(SWEEP_CSV):
         logger.error(f"Sweep CSV not found at {SWEEP_CSV}")
         return []
 
-    df_sweep = pd.read_csv(SWEEP_CSV)
+    df_sweep = pd.read_csv(SWEEP_CSV, dtype={"dataset": str})
 
     if os.path.exists(RESULTS_FILE):
         with open(RESULTS_FILE, "r") as f:
@@ -88,6 +83,7 @@ def run_sweep():
             "learning_rate": lr,
             "train_flops": int(c),
             "api_key": API_KEY,
+            "dataset": row["dataset"],
         }
 
         # Calculate actual N params

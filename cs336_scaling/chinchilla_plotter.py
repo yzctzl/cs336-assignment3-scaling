@@ -17,7 +17,7 @@ RESULT_DIRS = [
     "artifacts/chinchilla_sweep/mid",
     "artifacts/chinchilla_sweep/high",
 ]
-OUTPUT_DIR = "artifacts/chinchilla_sweep/final_plots_definitive"
+OUTPUT_DIR = "artifacts/chinchilla_sweep/low"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ---------------- Tool Functions ----------------
