@@ -5,6 +5,7 @@ import os
 import time
 from typing import Any, Dict
 
+import click
 import numpy as np
 import pandas as pd
 import requests
@@ -15,13 +16,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 # Constants
 API_URL = "http://localhost:8000/loss"
 API_KEY = "chinchilla_method2_sweep_key"
-TARGET_BUDGET = 1e19
-SWEEP_CSV = "cs336_scaling/sweep/low_budget.csv"
-RESULTS_FILE = "artifacts/chinchilla_sweep/low/results.json"
-PLOTS_DIR = "artifacts/chinchilla_sweep/low"
 
 
 def get_loss(config: Dict[str, Any], poll_interval: int = 30) -> float:
@@ -55,15 +53,11 @@ def get_loss(config: Dict[str, Any], poll_interval: int = 30) -> float:
             return float("nan")
 
 
-def run_sweep():
-    if not os.path.exists(SWEEP_CSV):
-        logger.error(f"Sweep CSV not found at {SWEEP_CSV}")
-        return []
+def run_sweep_file(csv_path: str, results_file: str):
+    df_sweep = pd.read_csv(csv_path, dtype={"dataset": str})
 
-    df_sweep = pd.read_csv(SWEEP_CSV, dtype={"dataset": str})
-
-    if os.path.exists(RESULTS_FILE):
-        with open(RESULTS_FILE, "r") as f:
+    if os.path.exists(results_file):
+        with open(results_file, "r") as f:
             all_results = json.load(f)
         logger.info(f"Loaded {len(all_results)} previous data points.")
     else:
@@ -72,7 +66,7 @@ def run_sweep():
     # Iterate through unique configs in CSV
     for _, row in df_sweep.iterrows():
         c = float(row["Budget"])
-        n_target = float(row["Besiroglu_N_Opt"])
+        n_target = float(row["N"])
         lr = float(row["LR"])
 
         config = {
@@ -114,13 +108,46 @@ def run_sweep():
                     "target_n": n_target,
                 }
             )
-            with open(RESULTS_FILE, "w") as f:
+            with open(results_file, "w") as f:
                 json.dump(all_results, f, indent=2)
             logger.info(f"Saved: Loss={loss:.4f}")
 
     return all_results
 
 
+@click.command()
+@click.option(
+    "--dir",
+    "directory",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True),
+    required=True,
+    help="Directory containing budget/supple CSV files",
+)
+def main(directory: str):
+    """
+    Scans the given directory for all CSV files, runs the sweep for each,
+    and updates a results.json in the same directory.
+    """
+    results_file = os.path.join(directory, "results.json")
+
+    # 获取目录下所有的 CSV 文件
+    csv_files = [
+        f
+        for f in os.listdir(directory)
+        if f.endswith("budget.csv") or f.endswith("supple.csv")
+    ]
+
+    if not csv_files:
+        logger.error(f"No CSV files found in {directory}")
+        return
+
+    logger.info(f"Found {len(csv_files)} CSV files in {directory}: {csv_files}")
+
+    for csv_file in csv_files:
+        csv_path = os.path.join(directory, csv_file)
+        logger.info(f"--- Processing {csv_file} ---")
+        run_sweep_file(csv_path, results_file)
+
+
 if __name__ == "__main__":
-    os.makedirs("data", exist_ok=True)
-    results = run_sweep()
+    main()
