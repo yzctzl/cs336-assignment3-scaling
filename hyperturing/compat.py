@@ -70,6 +70,49 @@ class HardwareCompat:
         elif self.is_cuda:
             torch.cuda.empty_cache()
 
+    def get_memory_info(self, rank: int = 0) -> dict[str, float]:
+        """Returns memory info in GB."""
+        if self.is_npu:
+            try:
+                # System-wide memory info: (free_memory, total_memory)
+                free, total = npu.mem_get_info(rank)
+                # Convert from bytes to GB
+                total_gb = total / (1024**3)
+                free_gb = free / (1024**3)
+                allocated_gb = total_gb - free_gb
+
+                # We can also get process-specific allocated memory for detailed logging
+                process_allocated = npu.memory_allocated(rank) / (1024**3)
+
+                return {
+                    "total": total_gb,
+                    "allocated": allocated_gb,  # System-wide used
+                    "process_allocated": process_allocated,  # This process only
+                    "free": free_gb,
+                }
+            except Exception as e:
+                logger.error(f"Error getting NPU memory info: {e}")
+                return {
+                    "total": 64.0,
+                    "allocated": 0.0,
+                    "process_allocated": 0.0,
+                    "free": 64.0,
+                }
+        elif self.is_cuda:
+            # CUDA equivalent: torch.cuda.mem_get_info()
+            free, total = torch.cuda.mem_get_info(rank)
+            total_gb = total / (1024**3)
+            free_gb = free / (1024**3)
+            allocated_gb = total_gb - free_gb
+            process_allocated = torch.cuda.memory_allocated(rank) / (1024**3)
+            return {
+                "total": total_gb,
+                "allocated": allocated_gb,
+                "process_allocated": process_allocated,
+                "free": free_gb,
+            }
+        return {"total": 0.0, "allocated": 0.0, "process_allocated": 0.0, "free": 0.0}
+
 
 compat = HardwareCompat()
 DEVICE_TYPE = compat.device_type

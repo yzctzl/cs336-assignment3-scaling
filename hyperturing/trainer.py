@@ -57,7 +57,6 @@ def train_worker(
     vocab_size: int,
     context_length: int,
     return_dict: Dict[int, float],
-    progress_queue: Optional[mp.Queue] = None,
 ):
     model: Optional[nn.Module] = None
     optimizer: Optional[torch.optim.Optimizer] = None
@@ -96,8 +95,6 @@ def train_worker(
 
         if world_size > 1:
             # FSDP for maximizing model size
-            # Use auto_wrap_policy for proper communication-computation overlap!
-            # Without this, the entire model is one FSDP unit, blocking all comms.
             model = FSDP(
                 model,
                 sharding_strategy=ShardingStrategy.FULL_SHARD,
@@ -117,7 +114,6 @@ def train_worker(
 
         compat.empty_cache()
 
-        # C = 6 * N * D
         n_params = 12 * num_layers * (d_model**2)
         num_tokens = int(train_flops / (6 * n_params))
         num_steps = num_tokens // (batch_size * context_length)
@@ -136,7 +132,6 @@ def train_worker(
                 logger.info(f"Attached to SharedMemory: {shm_info['name']}")
             except Exception as e:
                 logger.error(f"Failed to attach to SharedMemory: {e}")
-                # Fallback to disk load if SHM fails
                 data = np.load(train_data_path)
         else:
             data = np.load(train_data_path)
@@ -152,13 +147,10 @@ def train_worker(
         )
 
         model.train()
-        last_loss = 0.0
-
         prefetcher = DataPrefetcher(
             data, local_batch_size, context_length, cpu_generator, device, num_steps
         )
 
-        # Rationalize logging frequency: target ~16 logs per run
         log_interval = max(1, num_steps // 16)
 
         for step in range(num_steps):
@@ -182,14 +174,6 @@ def train_worker(
                 logger.info(
                     f"[Rank 0] Step {step + 1}/{num_steps}, Loss: {last_loss:.4f}"
                 )
-                if progress_queue:
-                    progress_queue.put(
-                        {
-                            "step": step + 1,
-                            "total_steps": num_steps,
-                            "loss": last_loss,
-                        }
-                    )
 
     except Exception as e:
         logger.error(f"Error in train_worker rank {rank}: {e}")
@@ -197,7 +181,6 @@ def train_worker(
     finally:
         if world_size > 1:
             cleanup_distributed()
-        # Ensure model and optimizer are deleted
         if "model" in locals():
             del model
         if "optimizer" in locals():
@@ -226,40 +209,41 @@ class Trainer:
             f"Trainer initialized for {DEVICE_TYPE} with world_size: {self.world_size}"
         )
 
-    def train(
-        self, config: Dict[str, Any], progress_queue: Optional[mp.Queue] = None
-    ) -> float:
+    def train(self, config: Dict[str, Any]) -> float:
         vocab_size = config.get("vocab_size", self.vocab_size)
         context_length = config.get("context_length", self.context_length)
 
-        # Always use mp.spawn to ensure process isolation for torch context
-        # This prevents NPU/GPU memory from being held by the parent process after a crash
         ctx = mp.get_context("spawn")
         port = find_free_port()
-        manager = ctx.Manager()
-        return_dict = manager.dict()
 
-        try:
-            mp.spawn(  # type: ignore
-                train_worker,
-                args=(
-                    self.world_size,
-                    port,
-                    config,
-                    self.train_data_path,
-                    self.shm_info,
-                    vocab_size,
-                    context_length,
-                    return_dict,
-                    progress_queue,
-                ),
-                nprocs=self.world_size,
-                join=True,
-            )
-        except Exception as e:
-            logger.error(f"mp.spawn failed: {e}")
-            raise e
-        finally:
-            compat.empty_cache()
+        with ctx.Manager() as manager:
+            return_dict = manager.dict()
+            try:
+                mp.spawn(  # type: ignore
+                    train_worker,
+                    args=(
+                        self.world_size,
+                        port,
+                        config,
+                        self.train_data_path,
+                        self.shm_info,
+                        vocab_size,
+                        context_length,
+                        return_dict,
+                    ),
+                    nprocs=self.world_size,
+                    join=True,
+                )
+            except Exception as e:
+                msg = str(e).lower()
+                if "out of memory" in msg or "acl api failed" in msg:
+                    logger.warning(
+                        "Trainer worker failed with OOM error. Propagating up."
+                    )
+                else:
+                    logger.error(f"mp.spawn failed: {e}")
+                raise e
+            finally:
+                compat.empty_cache()
 
-        return return_dict.get(0, 0.0)
+            return return_dict.get(0, 0.0)

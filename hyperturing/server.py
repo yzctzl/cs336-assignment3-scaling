@@ -9,11 +9,10 @@ from multiprocessing import shared_memory
 from typing import Any, Dict, Literal
 
 import numpy as np
-import torch.multiprocessing as mp
 from fastapi import FastAPI, HTTPException
 from starlette.concurrency import run_in_threadpool
 
-from .compat import compat
+from .compat import DEVICE_TYPE, compat
 from .database import Database
 from .trainer import Trainer
 
@@ -47,13 +46,158 @@ SCALING_LAWS_BUDGET = 2e18
 CONTEXT_LENGTH = 512
 
 # Global state
-active_queues: Dict[str, mp.Queue] = {}
-training_lock = asyncio.Lock()
+active_queues: Dict[
+    str, Any
+] = {}  # Keeping for backward compatibility if needed, but not used for queues
+dataset_loading_lock = asyncio.Lock()
 app_state = {
     "is_running": True,
     "shm_map": {},  # dataset_key -> {shm_name, shape, dtype, _ref}
 }
-dataset_loading_lock = asyncio.Lock()
+
+
+class ResourceManager:
+    def __init__(self, safe_threshold: float = 0.85):
+        self.default_threshold = safe_threshold
+        self.current_threshold = safe_threshold
+        self.active_jobs: Dict[str, Dict[str, Any]] = {}
+        self.lock = asyncio.Condition()
+        self.last_oom_time = 0.0
+        self.oom_cooldown = 60  # 60s cooldown after OOM
+        self.dynamic_overhead_factor = 1.0  # Adaptive safety margin
+
+    def estimate_memory_gb(self, config: Dict[str, Any]) -> float:
+        """
+        Estimate memory usage in GB.
+        Formula: Params (float16) + Gradients (float16) + Opt states (AdamW, float32)
+        Plus some overhead for activations and buffers.
+        N = 12 * num_layers * d_model^2
+        """
+        d_model = config["d_model"]
+        num_layers = config["num_layers"]
+        # Approx params
+        n_params = 12 * num_layers * (d_model**2)
+        # 2 bytes for float16 params, 2 for grads, 8 for AdamW states (2 x float32)
+        # Model memory = N * (2 + 2 + 8) = 12 * N bytes
+        model_mem_gb = (n_params * 12) / (1024**3)
+
+        # Activations: very rough estimate based on batch_size and context_length
+        # This is a guestimate, can be refined.
+        batch_size = config["batch_size"]
+        context_length = CONTEXT_LENGTH
+        # Rough activation factor: d_model * context_length * batch_size * layers * factor
+        # For simplicity, let's say 2x model memory or a base overhead.
+        activation_overhead = (
+            batch_size * context_length * d_model * num_layers * 4 * 4
+        ) / (1024**3)
+
+        # Apply dynamic overhead factor to activation estimate
+        total_est = (
+            model_mem_gb + (activation_overhead * self.dynamic_overhead_factor) + 0.5
+        )
+        return total_est
+
+    async def acquire(self, job_id: str, config: Dict[str, Any]):
+        async with self.lock:
+            while True:
+                now = asyncio.get_event_loop().time()
+                # Proactive factor decay: Reduce if 10 mins have passed since last OOM
+                if (
+                    self.dynamic_overhead_factor > 1.0
+                    and (now - self.last_oom_time) > 600
+                ):
+                    self.dynamic_overhead_factor = max(
+                        1.0, self.dynamic_overhead_factor - 0.05
+                    )
+                    logger.info(
+                        f"System stable. Adaptive overhead factor refined to {self.dynamic_overhead_factor:.2f}"
+                    )
+
+                est_mem = self.estimate_memory_gb(config)
+                in_cooldown = (now - self.last_oom_time) < self.oom_cooldown
+                target_threshold = self.default_threshold * (
+                    0.8 if in_cooldown else 1.0
+                )
+
+                mem_info = compat.get_memory_info()
+                current_allocated = mem_info["allocated"]
+                total_mem = mem_info["total"]
+
+                if total_mem > 0:
+                    capacity_total = total_mem * target_threshold
+                    available_capacity = capacity_total - current_allocated
+
+                    # Startup Lag Protection:
+                    # Subtract memory of jobs that started very recently (< 5s)
+                    # because their memory might not yet be reflected in mem_get_info()
+                    pending_startup_mem = sum(
+                        job["est_mem"]
+                        for job in self.active_jobs.values()
+                        if (now - job["started_at"]) < 5.0
+                    )
+
+                    # We treat pending memory as "already taken" from the *available* capacity
+                    # This is conservative but safe.
+                    adjusted_available = available_capacity - pending_startup_mem
+
+                    if adjusted_available >= est_mem:
+                        self.active_jobs[job_id] = {
+                            "est_mem": est_mem,
+                            "started_at": now,
+                            "config": config,  # Keep config for debugging/recovery
+                        }
+                        logger.info(
+                            f"Job {job_id} scheduled. Est: {est_mem:.2f}GB (Factor: {self.dynamic_overhead_factor:.2f}), "
+                            f"NPU: {current_allocated:.1f}/{total_mem:.1f}GB, Available: {available_capacity:.1f}GB"
+                        )
+                        return
+                else:
+                    # CPU mode or unknown? Fallback to sequential for safety
+                    if not self.active_jobs:
+                        self.active_jobs[job_id] = {"est_mem": 0.0, "started_at": now}
+                        return
+
+                await self.lock.wait()
+
+    def report_oom(self):
+        """Notification of runtime OOM to adjust future scheduling."""
+        self.last_oom_time = asyncio.get_event_loop().time()
+        # Increase safety margin more significantly if OOM occurs
+        self.dynamic_overhead_factor = min(4.0, self.dynamic_overhead_factor + 0.2)
+        logger.info(
+            f"Adaptive Scaling: Runtime OOM detected. Increasing safety margin. Current factor: {self.dynamic_overhead_factor:.2f}"
+        )
+
+    async def release(self, job_id: str):
+        async with self.lock:
+            if job_id in self.active_jobs:
+                del self.active_jobs[job_id]
+                self.lock.notify_all()
+
+    def get_status(self) -> Dict[str, Any]:
+        mem_info = compat.get_memory_info()
+        now = asyncio.get_event_loop().time()
+        in_cooldown = (now - self.last_oom_time) < self.oom_cooldown
+        target_threshold = self.default_threshold * (0.8 if in_cooldown else 1.0)
+
+        total_mem = mem_info["total"]
+        current_allocated = mem_info["allocated"]
+        available_capacity = max(0, total_mem * target_threshold - current_allocated)
+
+        return {
+            "active_tasks": len(self.active_jobs),
+            "total_memory_gb": total_mem,
+            "allocated_memory_gb": current_allocated,
+            "available_capacity_gb": round(available_capacity, 2),
+            "is_in_cooldown": in_cooldown,
+            "cooldown_remaining": max(0, self.oom_cooldown - (now - self.last_oom_time))
+            if in_cooldown
+            else 0,
+            "dynamic_overhead_factor": round(self.dynamic_overhead_factor, 2),
+        }
+
+
+resource_manager = ResourceManager()
 
 
 async def ensure_dataset_loaded(dataset: str):
@@ -180,10 +324,8 @@ async def guardian_task():
     logger.info("Guardian task started.")
     while app_state["is_running"]:
         try:
-            # Check for orphaned processes or unexpected memory bloat
-            # On NPU/GPU, clearing cache periodically when idle can help
-            if not training_lock.locked():
-                compat.empty_cache()
+            # Regularly clear cache to help with fragmentation
+            compat.empty_cache()
 
             # Additional health checks could go here
             await asyncio.sleep(60)
@@ -285,35 +427,31 @@ async def get_loss(
     if current_used + train_flops > SCALING_LAWS_BUDGET:
         raise HTTPException(status_code=403, detail="Scaling laws budget exceeded")
 
-    # 5. Serialize Execution using a Lock
-    # Only one training job can run at a time to prevent OOM
-    logger.info(f"Job {job_id} waiting for NPU lock...")
+    # Dynamic resource management
+    logger.info(f"Job {job_id} requesting resources...")
 
     async def run_training():
-        async with training_lock:
+        await resource_manager.acquire(job_id, config)
+        try:
             # Double check inside the lock for existing results (prevents redundant work from near-simultaneous requests)
             existing_loss = db.get_existing_run(api_key, config)
             if existing_loss is not None:
                 total_used = db.get_total_flops(api_key)
                 logger.info(
-                    f"Job {job_id} found existing result in DB after acquiring lock. Skipping."
+                    f"Job {job_id} found existing result in DB after acquiring resources. Skipping."
                 )
                 return {"loss": existing_loss, "total_flops_used": total_used}
 
-            # Initialize Job Tracking under lock to avoid orphaned PENDING records
+            # Initialize Job Tracking
             run_id = db.initialize_run(api_key, config)
             logger.info(
-                f"Job {job_id} (run_id: {run_id}) acquired NPU lock. Starting training."
+                f"Job {job_id} (run_id: {run_id}) started training on {DEVICE_TYPE}."
             )
             db.update_run_status(run_id, "RUNNING")
 
-            ctx = mp.get_context("spawn")
-            progress_queue = ctx.Queue()
-            active_queues[job_id] = progress_queue
-
             try:
                 # Run training in worker process via mp.spawn
-                loss = await run_in_threadpool(trainer.train, config, progress_queue)
+                loss = await run_in_threadpool(trainer.train, config)
 
                 # Record success
                 db.update_run_status(run_id, "SUCCESS", loss=loss)
@@ -324,21 +462,45 @@ async def get_loss(
 
             except Exception as e:
                 error_msg = str(e)
-                clean_error = (
-                    "NPU out of memory"
-                    if "out of memory" in error_msg.lower()
-                    else error_msg
-                )
+                if "out of memory" in error_msg.lower():
+                    # Simplified logging for OOM as requested
+                    logger.warning(
+                        f"Job {job_id} hit NPU OOM. Triggering adaptive backoff."
+                    )
+                    resource_manager.report_oom()
+                    db.update_run_status(
+                        run_id, "FAILED", error_message="NPU out of memory"
+                    )
+                    # Signal client to retry with 503
+                    raise HTTPException(
+                        status_code=503,
+                        detail="NPU out of memory, please retry later",
+                        headers={"Retry-After": "30"},
+                    )
+
                 logger.error(f"Job {job_id} failed: {error_msg}")
-                db.update_run_status(run_id, "FAILED", error_message=clean_error)
-                raise HTTPException(status_code=500, detail=clean_error)
+                db.update_run_status(run_id, "FAILED", error_message=error_msg)
+                raise HTTPException(status_code=500, detail=error_msg)
             finally:
-                if job_id in active_queues:
-                    del active_queues[job_id]
                 compat.empty_cache()
+        finally:
+            await resource_manager.release(job_id)
 
     # Use shield to ensure training completes even if client disconnects
     return await asyncio.shield(run_training())
+
+
+@app.get("/status")
+async def get_status(wait: bool = False):
+    if wait:
+        try:
+            # Wait for a job to finish or a timeout (to prevent hanging forever)
+            async with resource_manager.lock:
+                # We wait on the condition which is notified in release()
+                await asyncio.wait_for(resource_manager.lock.wait(), timeout=60.0)
+        except asyncio.TimeoutError:
+            pass
+    return resource_manager.get_status()
 
 
 @app.get("/total_flops_used")
