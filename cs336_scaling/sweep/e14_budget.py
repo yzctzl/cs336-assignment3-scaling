@@ -9,16 +9,23 @@ def generate_scaling_sweep(budgets):
     plan_rows = []
 
     for C_budget in budgets:
-        # 1. 动态确定 N 的搜索范围
-        # 基于 1e14 拟合出的 N_opt = 1.19e5
-        # 算力增加，最优 N 按照 sqrt(C) 比例移动 (Chinchilla 经验)
-        center_n = 1.19e5 * (C_budget / 1e14) ** 0.5
+        # --- 核心修改：大幅右移搜索中心以应对 vocab=256 的特性 ---
+        # 既然 1e14 在 1.19e5，而 6e14 在 6e5 还在跌
+        # 我们对 N_opt 采用更激进的缩放估计 (接近 C^1.0 的 Kaplan 缩放)
+        if C_budget < 4e14:  # 针对 3e14
+            center_n = 6.0e5
+            range_factor = 4.0  # 扫 1.5e5 到 2.4e6
+        else:  # 针对 6e14
+            center_n = 1.5e6
+            range_factor = 4.0  # 扫 3.7e5 到 6.0e6
 
-        # 3e14: 4/12, e14: 3/9
-        d, s = (4, 12) if C_budget < 5e14 else (3, 9)
+        num_models = 12  # 保持 12 个模型点以平衡分辨率和算力
 
-        # 覆盖中心点左右各 d 倍的范围，确保捕捉 U 型底
-        target_ns = np.logspace(np.log10(center_n / d), np.log10(center_n * d), s)
+        target_ns = np.logspace(
+            np.log10(center_n / range_factor),
+            np.log10(center_n * range_factor),
+            num_models,
+        )
 
         for t_n in target_ns:
             # 2. 架构对齐 (Non-Embedding Params: 12 * L * d^2)
@@ -52,13 +59,12 @@ def generate_scaling_sweep(budgets):
                 )
 
     df = pd.DataFrame(plan_rows)
-    # 去重
     df = df.drop_duplicates(subset=["Budget", "N", "LR"]).reset_index(drop=True)
     return df
 
 
 if __name__ == "__main__":
-    target_budgets = [3e14]  # , 6e14
+    target_budgets = [3e14, 6e14]
     df_plan = generate_scaling_sweep(target_budgets)
 
     # 路径确保存在
@@ -66,17 +72,22 @@ if __name__ == "__main__":
     os.makedirs(save_dir, exist_ok=True)
 
     for b in target_budgets:
-        # 修正匹配逻辑：统一不带加号的格式
-        b_label = f"{b:.0e}"  # "3e+14"
-        b_file_name = b_label.replace("+", "")  # "3e14"
+        b_label = f"{b:.0e}"  # 匹配 DataFrame 中的 "3e+14" 或 "6e+14"
+        b_file_name = b_label.replace("+", "")
 
         subset = df_plan[df_plan["Budget"] == b_label]
 
+        if subset.empty:
+            print(f"⚠️ 无法匹配 Budget {b_label}，请检查格式")
+            continue
+
+        # 确保子目录存在
+        os.makedirs(f"{save_dir}/{b_file_name}", exist_ok=True)
         file_path = f"{save_dir}/{b_file_name}/{b_file_name}_budget.csv"
         subset.to_csv(file_path, index=False)
 
-        print(f"\n### {b_file_name} 计划生成成功 (共 {len(subset)} 条) ###")
-        print(f"文件位置: {file_path}")
-        # 展示部分数据点，检查 D/N 覆盖情况
-        preview = subset.iloc[1::6]  # 跨步展示不同模型的中间 LR
+        print(f"\n### {b_file_name} 计划生成成功 (共 {len(subset)} 条任务) ###")
+        print(f"搜索区间: N 从 {subset['N'].min():.2e} 到 {subset['N'].max():.2e}")
+        # 检查 D/N 覆盖情况
+        preview = subset.iloc[1::3]  # 展示每个模型中间的 LR
         print(preview[["N", "d_model", "LR", "D_N_ratio"]].to_string(index=False))

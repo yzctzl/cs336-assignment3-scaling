@@ -254,7 +254,7 @@ def process_directory(directory: str, max_concurrent: int = 32):
     for csv_file in csv_files:
         logger.info(f"=== Starting Sweep: {csv_file} ===")
         csv_path = os.path.join(directory, csv_file)
-        results_file = os.path.join(directory, csv_file.replace(".csv", ".json"))
+        results_file = os.path.join(directory, "results.json")
         scheduler = SweepScheduler(csv_path, results_file)
         scheduler.run(max_concurrent=max_concurrent)
 

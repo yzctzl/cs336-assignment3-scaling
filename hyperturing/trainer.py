@@ -236,7 +236,16 @@ class Trainer:
                 )
             except Exception as e:
                 msg = str(e).lower()
-                if "out of memory" in msg or "acl api failed" in msg:
+                # Expanded OOM detection keywords based on NPU error logs
+                oom_keywords = [
+                    "out of memory",
+                    "acl api failed",
+                    "failed to allocate",
+                    "tried to allocate",
+                    "memory_allocation_failure",
+                    "npu out of memory",
+                ]
+                if any(k in msg for k in oom_keywords):
                     logger.warning(
                         "Trainer worker failed with OOM error. Propagating up."
                     )

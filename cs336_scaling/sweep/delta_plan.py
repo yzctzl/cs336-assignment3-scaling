@@ -97,7 +97,7 @@ def generate_supplemental_plan(
     type=click.Path(exists=True, dir_okay=True, readable=True),
     help="Path to results.json and output supplemental supple.csv",
 )
-@click.option("--budget", default=1e14, type=int, help="FLOPs budget")
+@click.option("--budget", default="1e14", type=str, help="FLOPs budget")
 @click.option("--dataset", default="256", help="Dataset identifier")
 @click.option("--fixed-l", default=6, type=int, help="Fixed number of layers")
 def main(result, budget, dataset, fixed_l):
@@ -105,9 +105,9 @@ def main(result, budget, dataset, fixed_l):
     分析现有实验结果，为没有找到 V 型底部的 N 档位生成增量补扫计划。
     """
     result_path = os.path.join(result, "results.json")
-    output_path = os.path.join(result, f"{budget:.0e}_supple.csv".replace('+', ''))
+    output_path = os.path.join(result, f"{budget}_supple.csv")
     df_supp = generate_supplemental_plan(
-        result_path, output_path, budget, dataset, fixed_l
+        result_path, output_path, int(float(budget)), dataset, fixed_l
     )
     if df_supp is not None:
         print(df_supp)

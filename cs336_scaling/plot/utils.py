@@ -65,3 +65,44 @@ def get_optimal_stats_per_n(data):
         best_losses.append(best_loss)
 
     return np.array(ns), np.array(best_lrs), np.array(best_losses)
+
+
+def get_min_stats_per_n(data):
+    """
+    Groups data by N and returns the actual minimum loss for each N (no LR fitting).
+    """
+    unique_ns = sorted(list(set([d["N"] for d in data])))
+    ns = []
+    min_losses = []
+
+    for n in unique_ns:
+        n_group = [d for d in data if d["N"] == n]
+        losses = [d["loss"] for d in n_group]
+        ns.append(n)
+        min_losses.append(min(losses))
+
+    return np.array(ns), np.array(min_losses)
+
+
+def fit_isoflop_curve(cleaned_n, cleaned_loss, fit_slice):
+    """
+    Log-Log 空间二次拟合 (寻找 U 型底)
+    我们拟合: Loss = a*(log10(N))^2 + b*log10(N) + c
+    """
+    # 选取中间部分进行拟合，对首尾不稳定的点做切片 (保持原逻辑)
+    log_n = np.log10(cleaned_n[fit_slice])
+    y = np.array(cleaned_loss[fit_slice])
+
+    # 使用 numpy 的多项式拟合
+    iso_poly = np.polyfit(log_n, y, 2)
+    a, b, c = iso_poly
+
+    # 计算 U 型底顶点 N_opt
+    # 对数空间极值点: log_n_opt = -b / (2a)
+    log_n_opt = -b / (2 * a)
+    n_opt = 10**log_n_opt
+
+    # 获取最优 Loss
+    loss_opt = a * log_n_opt**2 + b * log_n_opt + c
+
+    return a, b, c, n_opt, loss_opt
