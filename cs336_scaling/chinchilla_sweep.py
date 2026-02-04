@@ -3,6 +3,7 @@ import concurrent.futures
 import json
 import logging
 import os
+import threading
 import time
 from threading import Lock
 from typing import Any, Dict
@@ -14,6 +15,9 @@ from requests.exceptions import ConnectionError, Timeout
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Global shutdown event for graceful exit
+shutdown_event = threading.Event()
 
 # Constants
 API_URL = "http://localhost:8000/loss"
@@ -160,6 +164,9 @@ class SweepScheduler:
         return model_gb + act_gb + 0.5
 
     def process_row(self, row: pd.Series):
+        if shutdown_event.is_set():
+            return
+
         budget = float(row["Budget"])
         lr = float(row["LR"])
         n_target = float(row["N"])
@@ -185,8 +192,8 @@ class SweepScheduler:
 
         est_mem = self.estimate_job_memory(row)
 
-        # Capacity Pre-check: Don't even bother the server if we know it's full
-        while True:
+        # Capacity Pre-check: Check shutdown_event in loop
+        while not shutdown_event.is_set():
             try:
                 status = requests.get(STATUS_URL, timeout=10).json()
                 avail = status.get("available_capacity_gb", 0)
@@ -197,14 +204,31 @@ class SweepScheduler:
                     f"Local pre-check: Insufficient capacity for N={n_params:.1e} "
                     f"(Need {est_mem:.1f}GB, Have {avail:.1f}GB). Waiting..."
                 )
-                requests.get(f"{STATUS_URL}?wait=true", timeout=70)
+
+                # Check event during long wait simulation
+                for _ in range(7):  # 7 * 10s = 70s wait equivalent
+                    if shutdown_event.is_set():
+                        return
+                    try:
+                        # Use short wait to be responsive
+                        requests.get(f"{STATUS_URL}?wait=true", timeout=10)
+                    except Exception:
+                        pass
+
             except Exception:
-                time.sleep(10)
+                time.sleep(5)
+
+        if shutdown_event.is_set():
+            return
 
         logger.info(
             f"Dispatching N={n_params:.2e}, D={d_tokens:.0e}, Budget={budget:.1e}, LR={lr}"
         )
-        loss = get_loss(config)
+        try:
+            loss = get_loss(config)
+        except Exception as e:
+            logger.error(f"Task failed: {e}")
+            return
 
         if not np.isnan(loss):
             result = {
@@ -224,19 +248,44 @@ class SweepScheduler:
 
     def run(self, max_concurrent: int = 128):
         logger.info(f"Starting Sweep for {self.csv_path}...")
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=max_concurrent
-        ) as executor:
-            futures = [
-                executor.submit(self.process_row, row)
-                for _, row in self.df_sweep.iterrows()
-            ]
-            done, _ = concurrent.futures.wait(futures)
-            for f in done:
+
+        # Manually manage executor to allow fast shutdown (avoid 'with' block's forced wait)
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent)
+        futures = []
+
+        try:
+            # Submit tasks
+            for _, row in self.df_sweep.iterrows():
+                if shutdown_event.is_set():
+                    break
+                futures.append(executor.submit(self.process_row, row))
+
+            # Wait for completion or shutdown
+            for f in concurrent.futures.as_completed(futures):
+                if shutdown_event.is_set():
+                    break
                 try:
                     f.result()
                 except Exception as e:
                     logger.error(f"Sweep task failed with error: {e}")
+
+        except KeyboardInterrupt:
+            logger.info("\nRun interrupted by user.")
+            shutdown_event.set()
+
+        finally:
+            if shutdown_event.is_set():
+                logger.info("Shutdown event set. Cancelling pending tasks...")
+                # Best effort cancel for pending tasks
+                for f in futures:
+                    f.cancel()
+
+                logger.info("Shutting down executor (wait=False)...")
+                # Python 3.9+ supports cancel_futures=True
+                executor.shutdown(wait=False, cancel_futures=True)
+            else:
+                executor.shutdown(wait=True)
+            logger.info("Sweep run finished.")
 
 
 def process_directory(directory: str, max_concurrent: int = 32):
@@ -252,6 +301,9 @@ def process_directory(directory: str, max_concurrent: int = 32):
         return
 
     for csv_file in csv_files:
+        if shutdown_event.is_set():
+            break
+
         logger.info(f"=== Starting Sweep: {csv_file} ===")
         csv_path = os.path.join(directory, csv_file)
         results_file = os.path.join(directory, "results.json")
@@ -261,22 +313,18 @@ def process_directory(directory: str, max_concurrent: int = 32):
 
 if __name__ == "__main__":
     import argparse
+    import signal
 
     parser = argparse.ArgumentParser()
     parser.add_argument("directory", help="Directory with CSV files")
-    parser.add_argument("--concurrent", type=int, default=32)
+    parser.add_argument("--concurrent", type=int, default=8)
     args = parser.parse_args()
 
-    # Graceful Shutdown Handling
-    import signal
-    import sys
-
+    # Graceful Shutdown Handling: Just set the event
     def signal_handler(sig, frame):
-        logger.info("\nGraceful shutdown initiated. Cancelling pending tasks...")
-        # Since we are in a thread pool, we can't easily kill running threads
-        # but we can stop submitting new ones. The executor context manager handles wait.
-        # But we force exit to be responsive.
-        sys.exit(0)
+        logger.info("\nSIGINT received. Setting shutdown event...")
+        shutdown_event.set()
+        # Do NOT sys.exit() here. Let the run loop see the event and exit cleanly.
 
     signal.signal(signal.SIGINT, signal_handler)
 

@@ -1,8 +1,6 @@
 import asyncio
 import logging
 import os
-import signal
-import sys
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from multiprocessing import shared_memory
@@ -257,17 +255,8 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(guardian_task())
 
     # Handle signals for graceful shutdown
-    def signal_handler():
-        logger.info("Shutdown signal received.")
-        app_state["is_running"] = False
-        sys.exit(0)
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop = asyncio.get_event_loop()
-            loop.add_signal_handler(sig, signal_handler)
-        except NotImplementedError:
-            pass
+    # Uvicorn handles SIGINT/SIGTERM natively. We rely on that to trigger the shutdown phase.
+    # No custom signal handler needed here, as it conflicts with Uvicorn.
 
     yield
     # Shutdown: Clean up

@@ -82,7 +82,7 @@ def plot_results(
     plt.xscale("log")
     plt.xlabel("Non-Embedding Parameters (N)")
     plt.ylabel("Loss")
-    plt.title("Iso-FLOPs Profile @ 1e14")
+    plt.title("Iso-FLOPs Profile")
 
     # 5. 限制坐标轴区间
     plt.xlim(min(cleaned_n) * 0.8, max(cleaned_n) * 1.2)
