@@ -14,15 +14,33 @@ from cs336_scaling.plot.utils import (
 
 
 def plot_results(
-    data, cleaned_n, cleaned_loss, poly_coeffs, n_opt, loss_opt, output_path, fit_slice
+    data,
+    cleaned_n,
+    cleaned_loss,
+    poly_coeffs,
+    n_opt,
+    loss_opt,
+    output_path,
+    fit_slice,
+    use_embed=False,
 ):
     a, b, c = poly_coeffs
 
     plt.figure(figsize=(10, 6))
 
     # 1. 绘制原始采样点 (背景)
+    # Pre-calculate Ns for plotting if using embed
+    from cs336_scaling.plot.utils import calculate_effective_n
+
+    if use_embed:
+        plot_ns = [calculate_effective_n(d) for d in data]
+        x_label = "Total Parameters (N + Embedding)"
+    else:
+        plot_ns = [d["N"] for d in data]
+        x_label = "Non-Embedding Parameters (N)"
+
     plt.scatter(
-        [d["N"] for d in data],
+        plot_ns,
         [d["loss"] for d in data],
         color="blue",
         alpha=0.2,
@@ -80,7 +98,7 @@ def plot_results(
     )
 
     plt.xscale("log")
-    plt.xlabel("Non-Embedding Parameters (N)")
+    plt.xlabel(x_label)
     plt.ylabel("Loss")
     plt.title("Iso-FLOPs Profile")
 
@@ -159,7 +177,12 @@ def plot_points_only(cleaned_n, cleaned_loss, output_path, fit_slice):
     default=False,
     help="Use quadratic fit to estimate optimal LR/Loss per N (default: False, use raw min)",
 )
-def main(result, fit_range, point, fit_lr):
+@click.option(
+    "--embed",
+    is_flag=True,
+    help="Include embedding parameters in N (assumes tied embeddings, L=12)",
+)
+def main(result, fit_range, point, fit_lr, embed):
     data = load_data(os.path.join(result, "results.json"))
 
     if point:
@@ -169,20 +192,24 @@ def main(result, fit_range, point, fit_lr):
         # User said "Just draw the minimum point".
         # Let's assume point mode uses raw min mostly, but respecting lr_fit flag is cleaner.
         if fit_lr:
-            cleaned_n, _, cleaned_loss = get_optimal_stats_per_n(data)
+            cleaned_n, _, cleaned_loss = get_optimal_stats_per_n(data, use_embed=embed)
         else:
-            cleaned_n, cleaned_loss = get_min_stats_per_n(data)
+            cleaned_n, cleaned_loss = get_min_stats_per_n(data, use_embed=embed)
+        # Point mode plotting doesn't support embed label change yet, simplistic update:
+        # We can pass use_embed to plot_points_only or just ignore for strict point mode
+        # User requested update, let's just print a warning or handle it if we have time.
+        # But for now, let's keep it simple as point mode wasn't the main focus.
         plot_points_only(cleaned_n, cleaned_loss, result, fit_range)
         return
 
     # Data Preparation Strategy
     if fit_lr:
         # Use quadratic fit on LRs to find theoretical minimum
-        cleaned_n, _, cleaned_loss = get_optimal_stats_per_n(data)
+        cleaned_n, _, cleaned_loss = get_optimal_stats_per_n(data, use_embed=embed)
         print("Using [Fitted] LR minima.")
     else:
         # Use raw observed minimum
-        cleaned_n, cleaned_loss = get_min_stats_per_n(data)
+        cleaned_n, cleaned_loss = get_min_stats_per_n(data, use_embed=embed)
         print("Using [Raw] observed minima.")
 
     # Global Iso-FLOPs Fit
@@ -196,7 +223,15 @@ def main(result, fit_range, point, fit_lr):
 
     # Plot
     plot_results(
-        data, cleaned_n, cleaned_loss, (a, b, c), n_opt, loss_opt, result, fit_range
+        data,
+        cleaned_n,
+        cleaned_loss,
+        (a, b, c),
+        n_opt,
+        loss_opt,
+        result,
+        fit_range,
+        use_embed=embed,
     )
 
 

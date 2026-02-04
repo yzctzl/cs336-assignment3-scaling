@@ -3,6 +3,13 @@ import json
 import click
 import numpy as np
 
+VOCAB_SIZES = {
+    "tss": 10000,
+    "256": 256,
+    "owt": 32000,
+    "sp6": 32000,
+}
+
 
 class SliceParam(click.ParamType):
     name = "slice"
@@ -22,7 +29,27 @@ def load_data(result_path):
         return json.load(raw_json)
 
 
-def get_optimal_stats_per_n(data):
+def calculate_effective_n(d):
+    """
+    Calculate effective parameter count including embeddings.
+    Assumes tied embeddings (1x vocab_size * d_model) and L=12 for d_model estimation.
+    """
+    n_non_embed = d["N"]
+
+    # Estimate d_model assuming L=12
+    # N = 12 * L * d^2  => d = sqrt(N / 144)
+    L = 12
+    d_model = np.sqrt(n_non_embed / (12 * L))
+
+    # Get vocab size (default to 256 for legacy compatibility)
+    dataset = d.get("dataset", "256")
+    vocab_size = VOCAB_SIZES.get(str(dataset), 256)
+
+    # Add embedding parameters (vocab_size * d_model)
+    return n_non_embed + (vocab_size * d_model)
+
+
+def get_optimal_stats_per_n(data, use_embed=False):
     """
     对于每个 N，通过对 LR-Loss 响应做二次拟合，找到最优的 LR 和对应的 Loss 估算值。
     """
@@ -34,6 +61,13 @@ def get_optimal_stats_per_n(data):
     for n in unique_ns:
         n_group = [d for d in data if d["N"] == n]
         log_lrs = np.log10([d["LR"] for d in n_group])
+
+        if use_embed:
+            # Calculate effective N for this group (using the first item as representative)
+            current_n = calculate_effective_n(n_group[0])
+        else:
+            current_n = n
+
         losses = np.array([d["loss"] for d in n_group])
 
         # 对 LR 响应做二次拟合: Loss = a*(log10(LR))^2 + b*log10(LR) + c
@@ -60,14 +94,14 @@ def get_optimal_stats_per_n(data):
             best_lr = n_group[np.argmin(losses)]["LR"]
             best_loss = np.min(losses)
 
-        ns.append(n)
+        ns.append(current_n)
         best_lrs.append(best_lr)
         best_losses.append(best_loss)
 
     return np.array(ns), np.array(best_lrs), np.array(best_losses)
 
 
-def get_min_stats_per_n(data):
+def get_min_stats_per_n(data, use_embed=False):
     """
     Groups data by N and returns the actual minimum loss for each N (no LR fitting).
     """
@@ -78,7 +112,12 @@ def get_min_stats_per_n(data):
     for n in unique_ns:
         n_group = [d for d in data if d["N"] == n]
         losses = [d["loss"] for d in n_group]
-        ns.append(n)
+
+        if use_embed:
+            ns.append(calculate_effective_n(n_group[0]))
+        else:
+            ns.append(n)
+
         min_losses.append(min(losses))
 
     return np.array(ns), np.array(min_losses)
