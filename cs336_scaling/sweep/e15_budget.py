@@ -4,93 +4,82 @@ import numpy as np
 import pandas as pd
 
 
-def generate_chinchilla_6e15_v10k_sweep():
-    # 1. 设定基础参数
-    C_budget = 6.0e15
-    FIXED_L = 6
-    FIXED_LR = 5e-4
+def generate_fixed_layer_sweep(budget=6e15, L=6, num_points=18, lr = 5e-4):
     VOCAB_SIZE = 10000
+    # BATCH_SIZE = 128
+    LEARNING_RATE = lr
+    NUM_HEADS = 8
 
-    # 2. 根据 D/N 约束区间 [11, 180] 确定总参数量 N_total 的物理边界
-    # 公式推导: C = 6 * N_total * D => D = C / (6 * N_total)
-    # D/N = C / (6 * N_total^2) => N_total = sqrt(C / (6 * (D/N)))
-    n_total_min = np.sqrt(C_budget / (6 * 180))  # 约 2.36M
-    n_total_max = np.sqrt(C_budget / (6 * 11))  # 约 9.53M
+    # Range of D/N (Total) from 11 to 180
+    n_total_min = np.sqrt(budget / (6 * 180))
+    n_total_max = np.sqrt(budget / (6 * 11))
 
-    # 3. 在 log 空间生成 16 个目标总参数量点
-    target_ns = np.logspace(np.log10(n_total_min), np.log10(n_total_max), 16)
+    # Generate target N_total in log space
+    target_n_totals = np.logspace(
+        np.log10(n_total_min), np.log10(n_total_max), num_points * 2
+    )  # Generate more to account for rounding/clashing
 
-    plan_rows = []
-
-    for t_n in target_ns:
-        # 4. 求解架构参数 d_model
-        # N_total = N_logic + N_emb
-        # N_total = (12 * L * d^2) + (V * d)
-        # 这是一个一元二次方程: 144*d^2 + 10000*d - t_n = 0
-        a = 12 * FIXED_L
+    plan = []
+    for t_n_total in target_n_totals:
+        # Solve 12*L*d^2 + V*d - t_n_total = 0
+        a = 12 * L
         b = VOCAB_SIZE
-        c = -t_n
-
-        # 求根公式: d = (-b + sqrt(b^2 - 4ac)) / 2a
+        c = -t_n_total
         d_raw = (-b + np.sqrt(b**2 - 4 * a * c)) / (2 * a)
 
-        # 将 d_model 对齐到 4 的倍数，防止 16 个点发生折叠合并
-        d_model = int(max(64, round(d_raw / 4) * 4))
+        # Aligned d_model (must be divisible by num_heads)
+        d_model = int(round(d_raw / NUM_HEADS) * NUM_HEADS)
+        d_model = max(64, min(1024, d_model))
 
-        # 5. 重新计算精确的参数量和 Token 数
-        n_logic = 12 * FIXED_L * (d_model**2)
+        # Calculate actuals
+        n_non_emb = 12 * L * (d_model**2)
         n_emb = VOCAB_SIZE * d_model
-        n_total_actual = n_logic + n_emb
+        n_total = n_non_emb + n_emb
 
-        # 严格按照 6ND 计算 Token 数以保证算力对齐
-        tokens = C_budget / (6 * n_total_actual)
-        dn_ratio_actual = tokens / n_total_actual
+        tokens = budget / (6 * n_total)
+        dn_ratio = tokens / n_total
 
-        plan_rows.append(
+        plan.append(
             {
-                "Budget": "6e15",
-                "N_logic": int(n_logic),
-                "N_emb": int(n_emb),
-                "N": int(n_total_actual),
+                "Budget": f"{budget:.0e}",
+                "layers": L,
                 "d_model": d_model,
-                "layers": FIXED_L,
-                "heads": 8,
-                "LR": float(f"{FIXED_LR:.2e}"),
+                "heads": NUM_HEADS,
+                # "batch_size": BATCH_SIZE,
+                "LR": LEARNING_RATE,
+                "N_non_emb": int(n_non_emb),
+                "N_emb": int(n_total - n_non_emb),
+                "N": int(n_total),
+                "D_N_ratio": round(dn_ratio, 2),
                 "Tokens": float(f"{tokens:.2e}"),
                 "dataset": "tss",
-                "D_N_ratio": round(dn_ratio_actual, 2),
             }
         )
 
-    df = pd.DataFrame(plan_rows)
-    # 按照 N_total 排序以方便绘图
+    df = pd.DataFrame(plan)
+    # Drop duplicate d_models to keep exactly one point per distinct architecture
     df = (
-        df.sort_values("N")
-        .drop_duplicates(subset=["N"])
+        df.drop_duplicates(subset=["d_model"])
+        .sort_values("d_model")
         .reset_index(drop=True)
     )
+
+    # If we have too many points, sample them evenly to reach target
+    if len(df) > num_points:
+        indices = np.linspace(0, len(df) - 1, num_points).astype(int)
+        df = df.iloc[indices].reset_index(drop=True)
+
     return df
 
 
-if __name__ == "__main__":
-    df_plan = generate_chinchilla_6e15_v10k_sweep()
+BUDGET = "1e15"
 
-    # 保存结果
-    save_path = "artifacts/chinchilla_sweep/6e15/v10k_aligned.csv"
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    df_plan.to_csv(save_path, index=False)
+df_fixed = generate_fixed_layer_sweep(float(BUDGET), L=6, num_points=18)
+os.makedirs(f"artifacts/chinchilla_sweep/{BUDGET}", exist_ok=True)
+df_fixed.to_csv(f"artifacts/chinchilla_sweep/{BUDGET}/{BUDGET}_budget.csv", index=False)
 
-    print(f"实际生成点数: {len(df_plan)}")
-    print(
-        f"总参数量范围: {df_plan['N'].min():.2e} -> {df_plan['N'].max():.2e}"
+print(
+    df_fixed[["layers", "d_model", "N_non_emb", "N", "D_N_ratio"]].to_string(
+        index=False
     )
-    print(
-        f"D/N (全口径) 区间: {df_plan['D_N_ratio'].min()} -> {df_plan['D_N_ratio'].max()}"
-    )
-    print("-" * 60)
-    # 预览关键列
-    print(
-        df_plan[["N", "d_model", "LR", "Tokens", "D_N_ratio"]].to_string(
-            index=False
-        )
-    )
+)
