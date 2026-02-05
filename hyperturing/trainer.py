@@ -114,11 +114,17 @@ def train_worker(
 
         compat.empty_cache()
 
-        n_params = 12 * num_layers * (d_model**2)
-        num_tokens = int(train_flops / (6 * n_params))
+        # n_params = 12 * num_layers * (d_model**2)
+        # num_tokens = int(train_flops / (6 * n_params))
+        # num_steps = num_tokens // (batch_size * context_length)
+        # if num_steps <= 0:
+        #     num_steps = 1
+
+        n_logic = 12 * num_layers * (d_model**2)
+        n_emb = vocab_size * d_model 
+        n_total = n_logic + n_emb 
+        num_tokens = int(train_flops / (6 * n_total))
         num_steps = num_tokens // (batch_size * context_length)
-        if num_steps <= 0:
-            num_steps = 1
 
         # Shared Memory / Direct Memory Loading
         data = None

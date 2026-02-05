@@ -4,77 +4,93 @@ import numpy as np
 import pandas as pd
 
 
-def generate_stable_v10k_sweep(budgets):
-    # 增加深度至 12 层以提升大模型训练稳定性
-    FIXED_L = 12
+def generate_chinchilla_6e15_v10k_sweep():
+    # 1. 设定基础参数
+    C_budget = 6.0e15
+    FIXED_L = 6
+    FIXED_LR = 5e-4
+    VOCAB_SIZE = 10000
+
+    # 2. 根据 D/N 约束区间 [11, 180] 确定总参数量 N_total 的物理边界
+    # 公式推导: C = 6 * N_total * D => D = C / (6 * N_total)
+    # D/N = C / (6 * N_total^2) => N_total = sqrt(C / (6 * (D/N)))
+    n_total_min = np.sqrt(C_budget / (6 * 180))  # 约 2.36M
+    n_total_max = np.sqrt(C_budget / (6 * 11))  # 约 9.53M
+
+    # 3. 在 log 空间生成 16 个目标总参数量点
+    target_ns = np.logspace(np.log10(n_total_min), np.log10(n_total_max), 16)
+
     plan_rows = []
 
-    for C_budget in budgets:
-        # 1. 动态预估 N_opt 中心点
-        # 考虑到 V=10k 的 Embedding 成本，1e15 时 N_opt 约在 2.5M
-        # 按照 C^0.5 规律平移中心
-        center_n = 2.5e6 * (C_budget / 1e15) ** 0.5
+    for t_n in target_ns:
+        # 4. 求解架构参数 d_model
+        # N_total = N_logic + N_emb
+        # N_total = (12 * L * d^2) + (V * d)
+        # 这是一个一元二次方程: 144*d^2 + 10000*d - t_n = 0
+        a = 12 * FIXED_L
+        b = VOCAB_SIZE
+        c = -t_n
 
-        # 2. 窄范围高分辨率扫描 (仅覆盖中心点左右各 3 倍)
-        # 采样 10 个点以确保每档实验量控制在 30 个左右
-        target_ns = np.logspace(np.log10(center_n / 3), np.log10(center_n * 3), 10)
+        # 求根公式: d = (-b + sqrt(b^2 - 4ac)) / 2a
+        d_raw = (-b + np.sqrt(b**2 - 4 * a * c)) / (2 * a)
 
-        for t_n in target_ns:
-            # 3. 架构对齐 (Non-Embedding Params)
-            d_raw = np.sqrt(t_n / (12 * FIXED_L))
-            d_model = int(max(64, round(d_raw / 32) * 32))  # 步进设为 32 以对齐硬件优化
-            n_actual = 12 * FIXED_L * (d_model**2)
+        # 将 d_model 对齐到 4 的倍数，防止 16 个点发生折叠合并
+        d_model = int(max(64, round(d_raw / 4) * 4))
 
-            # 4. 算力约束下的 Token 数 D
-            tokens = C_budget / (6 * n_actual)
-            dn_ratio = tokens / n_actual
+        # 5. 重新计算精确的参数量和 Token 数
+        n_logic = 12 * FIXED_L * (d_model**2)
+        n_emb = VOCAB_SIZE * d_model
+        n_total_actual = n_logic + n_emb
 
-            # 5. 科学的 LR 推断：基于 N^-0.5 规律
-            # 锚点设定：1M 参数时 LR 约 6e-3 (对应 V=10k 经验值)
-            # lr_anchor = 0.006 * (n_actual / 1e6) ** -0.5
+        # 严格按照 6ND 计算 Token 数以保证算力对齐
+        tokens = C_budget / (6 * n_total_actual)
+        dn_ratio_actual = tokens / n_total_actual
 
-            # 使用更密的探测步长 [0.8x, 1.0x, 1.25x]
-            # lrs = [lr_anchor * 0.8, lr_anchor, lr_anchor * 1.25]
-            lrs = [1e-3]
-
-            for lr in lrs:
-                plan_rows.append(
-                    {
-                        "Budget": f"{C_budget:.0e}",
-                        "N": int(n_actual),
-                        "d_model": d_model,
-                        "layers": FIXED_L,
-                        "heads": 8 if d_model >= 128 else 4,
-                        "LR": float(f"{lr:.2e}"),
-                        "Tokens": float(f"{tokens:.2e}"),
-                        "dataset": "tss",
-                        "D_N_ratio": round(dn_ratio, 2),
-                    }
-                )
+        plan_rows.append(
+            {
+                "Budget": "6e15",
+                "N_logic": int(n_logic),
+                "N_emb": int(n_emb),
+                "N": int(n_total_actual),
+                "d_model": d_model,
+                "layers": FIXED_L,
+                "heads": 8,
+                "LR": float(f"{FIXED_LR:.2e}"),
+                "Tokens": float(f"{tokens:.2e}"),
+                "dataset": "tss",
+                "D_N_ratio": round(dn_ratio_actual, 2),
+            }
+        )
 
     df = pd.DataFrame(plan_rows)
-    return df.drop_duplicates(subset=["Budget", "N", "LR"]).reset_index(drop=True)
+    # 按照 N_total 排序以方便绘图
+    df = (
+        df.sort_values("N")
+        .drop_duplicates(subset=["N"])
+        .reset_index(drop=True)
+    )
+    return df
 
 
 if __name__ == "__main__":
-    # 生成 3e15 和 6e15 的计划
-    target_budgets = [6e15]
-    df_plan = generate_stable_v10k_sweep(target_budgets)
+    df_plan = generate_chinchilla_6e15_v10k_sweep()
 
-    save_dir = "artifacts/chinchilla_sweep/"
-    os.makedirs(save_dir, exist_ok=True)
+    # 保存结果
+    save_path = "artifacts/chinchilla_sweep/6e15/v10k_aligned.csv"
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    df_plan.to_csv(save_path, index=False)
 
-    for b in target_budgets:
-        b_label = f"{b:.0e}"
-        b_file_name = b_label.replace("+", "")
-        subset = df_plan.loc[df_plan["Budget"] == b_label]
-
-        os.makedirs(f"{save_dir}/{b_file_name}", exist_ok=True)
-        file_path = f"{save_dir}/{b_file_name}/{b_file_name}_budget.csv"
-        subset.to_csv(file_path, index=False)
-
-        print(f"\n### {b_file_name} 稳定版计划生成 (共 {len(subset)} 个任务) ###")
-        print(f"搜索区间: N 从 {subset['N'].min():.2e} 到 {subset['N'].max():.2e}")
-        # 预览
-        preview = subset.drop_duplicates(subset="N")
-        print(preview[["N", "d_model", "LR", "D_N_ratio"]].to_string(index=False))
+    print(f"实际生成点数: {len(df_plan)}")
+    print(
+        f"总参数量范围: {df_plan['N'].min():.2e} -> {df_plan['N'].max():.2e}"
+    )
+    print(
+        f"D/N (全口径) 区间: {df_plan['D_N_ratio'].min()} -> {df_plan['D_N_ratio'].max()}"
+    )
+    print("-" * 60)
+    # 预览关键列
+    print(
+        df_plan[["N", "d_model", "LR", "Tokens", "D_N_ratio"]].to_string(
+            index=False
+        )
+    )
