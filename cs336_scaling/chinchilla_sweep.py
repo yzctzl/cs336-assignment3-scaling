@@ -5,19 +5,21 @@ import logging
 import os
 import threading
 import time
+import weakref
 from threading import Lock
 from typing import Any, Dict
 
 import numpy as np
 import pandas as pd
 import requests
-from requests.exceptions import ConnectionError, Timeout
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Global shutdown event for graceful exit
 shutdown_event = threading.Event()
+# Track active sessions to force-close them on shutdown
+active_sessions = weakref.WeakSet()
 
 # Constants
 API_URL = "http://localhost:8000/loss"
@@ -56,54 +58,70 @@ def get_loss(config: Dict[str, Any]) -> float:
         return None
 
     while True:
+        # 1. Attempt to execute the task
         try:
-            # We use a very long timeout for the training request itself
-            # but wrap it in logic that can recover from disconnections.
-            response = requests.get(
-                API_URL, params={**config, "api_key": API_KEY}, timeout=None
-            )
-
-            if response.status_code == 200:
-                return response.json()["loss"]
-
-            if response.status_code == 404:
-                logger.error(f"Invalid configuration (404): {config}")
+            if shutdown_event.is_set():
                 return float("nan")
 
-            if response.status_code == 403:
-                detail = response.json().get("detail", "")
-                logger.error(f"Forbidden (403): {detail}")
-                return float("nan")
-
-            if response.status_code == 503:
-                # Server busy or OOM. Wait for a completion.
-                logger.info(
-                    "Server busy (503). Waiting for capacity via long polling..."
-                )
+            with requests.Session() as session:
+                active_sessions.add(session)
                 try:
-                    requests.get(f"{STATUS_URL}?wait=true", timeout=70)
-                except Exception:
-                    time.sleep(10)
-                continue
+                    # Block indefinitely for the slot
+                    response = session.get(
+                        API_URL, params={**config, "api_key": API_KEY}, timeout=None
+                    )
+                except (
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.ChunkedEncodingError,
+                ):
+                    if shutdown_event.is_set():
+                        return float("nan")
+                    raise
 
-            logger.error(f"Server error {response.status_code}. Retrying...")
-            time.sleep(10)
+                if response.status_code == 200:
+                    return response.json()["loss"]
 
-        except (Timeout, ConnectionError) as e:
-            logger.warning(
-                f"Connection issue: {e}. Checking if task finished in background..."
-            )
-            # If we timed out or lost connection, the server might still be working (asyncio.shield)
+                if response.status_code in [404, 403]:
+                    logger.error(f"Fatal error {response.status_code}: {response.text}")
+                    return float("nan")
+
+                # If 500 or 503, we fall through to the wait logic
+                if response.status_code == 503:
+                    pass  # Expected "busy" state
+                else:
+                    logger.error(
+                        f"Server error {response.status_code}. Waiting for signal..."
+                    )
+
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+            requests.exceptions.Timeout,
+        ) as e:
+            logger.warning(f"Connection issue: {e}. Checking background...")
             loss = check_background_completion()
             if loss is not None:
-                logger.info("Task found completed in background. Recovered loss.")
                 return loss
+            # Fall through to wait logic
 
-            logger.info("Task not found in background. Re-submitting in 30s...")
-            time.sleep(30)
         except Exception as e:
-            logger.error(f"Unexpected error: {e}. Retrying...")
-            time.sleep(10)
+            logger.error(f"Unexpected error: {e}. Retrying after signal...")
+
+        # 2. Wait for signal (Barrier)
+        # We failed to get a result (503, 500, or Network Error).
+        # We block here until the server tells us a job has finished (capacity freed).
+        try:
+            if shutdown_event.is_set():
+                return float("nan")
+
+            with requests.Session() as wait_session:
+                active_sessions.add(wait_session)
+                # This blocks indefinitly until server notifies (or we kill it)
+                wait_session.get(f"{STATUS_URL}?wait=true", timeout=None)
+        except Exception:
+            # If the wait itself fails (e.g. server down), we sleep briefly to avoid tight loop
+            if shutdown_event.wait(5):
+                return float("nan")
 
 
 class SweepScheduler:
@@ -230,6 +248,9 @@ class SweepScheduler:
             logger.error(f"Task failed: {e}")
             return
 
+        if shutdown_event.is_set():
+            return
+
         if not np.isnan(loss):
             result = {
                 "N": n_params,
@@ -261,13 +282,22 @@ class SweepScheduler:
                 futures.append(executor.submit(self.process_row, row))
 
             # Wait for completion or shutdown
-            for f in concurrent.futures.as_completed(futures):
-                if shutdown_event.is_set():
-                    break
-                try:
-                    f.result()
-                except Exception as e:
-                    logger.error(f"Sweep task failed with error: {e}")
+            # We convert list to set for efficient removal
+            pending_futures = set(futures)
+            while pending_futures and not shutdown_event.is_set():
+                # Wait for at least one future to complete, but timeout quickly to check shutdown_event
+                done, _ = concurrent.futures.wait(
+                    pending_futures,
+                    timeout=0.5,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+
+                for f in done:
+                    pending_futures.remove(f)
+                    try:
+                        f.result()
+                    except Exception as e:
+                        logger.error(f"Sweep task failed with error: {e}")
 
         except KeyboardInterrupt:
             logger.info("\nRun interrupted by user.")
@@ -288,7 +318,7 @@ class SweepScheduler:
             logger.info("Sweep run finished.")
 
 
-def process_directory(directory: str, max_concurrent: int = 32):
+def process_directory(directory: str, max_concurrent: int = 4):
     csv_files = [
         f
         for f in os.listdir(directory)
@@ -317,15 +347,31 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("directory", help="Directory with CSV files")
-    parser.add_argument("--concurrent", type=int, default=8)
+    parser.add_argument("--concurrent", type=int, default=1)
     args = parser.parse_args()
 
-    # Graceful Shutdown Handling: Just set the event
+    # Graceful Shutdown Handling
     def signal_handler(sig, frame):
         logger.info("\nSIGINT received. Setting shutdown event...")
         shutdown_event.set()
-        # Do NOT sys.exit() here. Let the run loop see the event and exit cleanly.
+
+        # Force close all active sessions to unblock threads waiting on generic read()
+        logger.info(
+            f"Closing {len(active_sessions)} active sessions to unblock helper threads..."
+        )
+        for session in list(active_sessions):
+            try:
+                session.close()
+            except Exception:
+                pass
 
     signal.signal(signal.SIGINT, signal_handler)
 
     process_directory(args.directory, max_concurrent=args.concurrent)
+
+    if shutdown_event.is_set():
+        logger.info(
+            "Shutdown event was set. Exiting via os._exit to bypass daemon thread waits."
+        )
+        logging.shutdown()
+        os._exit(0)
