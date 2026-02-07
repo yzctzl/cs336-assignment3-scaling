@@ -1,6 +1,7 @@
 import logging
 import os
 import socket
+import importlib
 from multiprocessing import shared_memory
 from typing import Any, Dict, Optional
 
@@ -51,6 +52,51 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
+def _resolve_npu_amp_components():
+    """Resolve NPU AMP objects across torch_npu API variants."""
+    scaler_cls = None
+    autocast_fn = None
+    tried: list[str] = []
+
+    for module_name in ("torch_npu.npu.amp", "torch_npu.amp"):
+        try:
+            module = importlib.import_module(module_name)
+            tried.append(module_name)
+        except Exception as exc:
+            tried.append(f"{module_name}:{exc.__class__.__name__}")
+            continue
+
+        if scaler_cls is None and hasattr(module, "GradScaler"):
+            scaler_cls = getattr(module, "GradScaler")
+        if autocast_fn is None and hasattr(module, "autocast"):
+            autocast_fn = getattr(module, "autocast")
+
+    return scaler_cls, autocast_fn, ", ".join(tried)
+
+
+def _build_npu_autocast_context(autocast_fn, dtype):
+    """Create an autocast context manager compatible with different torch_npu versions."""
+    if autocast_fn is not None:
+        for kwargs in (
+            {"enabled": True, "dtype": dtype},
+            {"dtype": dtype},
+            {"enabled": True},
+            {},
+        ):
+            try:
+                return autocast_fn(**kwargs)
+            except TypeError:
+                continue
+            except Exception:
+                break
+
+    return torch.autocast(
+        device_type=compat.device_type,
+        dtype=dtype,
+        enabled=True,
+    )
+
+
 def train_worker(
     rank: int,
     world_size: int,
@@ -93,7 +139,11 @@ def train_worker(
         num_layers = config["num_layers"]
         num_heads = config["num_heads"]
         batch_size = config["batch_size"]
-        learning_rate = config["learning_rate"]
+        base_lr = config["learning_rate"]
+        lr_scale = float(os.getenv("TRAINING_LR_SCALE", "1.0"))
+        if lr_scale <= 0:
+            lr_scale = 1.0
+        learning_rate = base_lr * lr_scale
         train_flops = config["train_flops"]
 
         local_batch_size = batch_size // world_size if world_size > 0 else batch_size
@@ -165,6 +215,9 @@ def train_worker(
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=num_steps, eta_min=learning_rate / 10.0
         )
+        loss_guard = float(os.getenv("TRAINING_LOSS_GUARD", "20.0"))
+        if config.get("loss_guard_override") is not None:
+            loss_guard = float(config["loss_guard_override"])
 
         amp_enabled = (
             os.getenv("TRAINING_AMP", "1") == "1"
@@ -175,16 +228,50 @@ def train_worker(
             autocast_dtype = torch.bfloat16
         else:
             autocast_dtype = torch.float16
+        # Allow runtime override for stability retries
+        if config.get("amp_dtype_override") is not None:
+            override = config["amp_dtype_override"]
+            if isinstance(override, str):
+                autocast_dtype = torch.bfloat16 if override.lower() == "bf16" else torch.float16
+            else:
+                autocast_dtype = override
+        if config.get("amp_enabled_override") is not None:
+            amp_enabled = bool(config["amp_enabled_override"])
         scaler = None
+        npu_autocast_fn = None
+        npu_amp_sources = ""
         if amp_enabled and compat.is_cuda:
             scaler = torch.cuda.amp.GradScaler()
         elif amp_enabled and compat.is_npu:
-            try:
-                from torch_npu.amp import GradScaler as NPUGradScaler  # type: ignore
+            scaler_cls, npu_autocast_fn, npu_amp_sources = _resolve_npu_amp_components()
+            if scaler_cls is not None:
+                try:
+                    scaler = scaler_cls()
+                except Exception:
+                    scaler = None
 
-                scaler = NPUGradScaler()
-            except Exception:
-                scaler = None
+            if autocast_dtype == torch.float16 and scaler is None:
+                fallback_to_bf16 = os.getenv("TRAINING_FP16_FALLBACK_BF16", "1") == "1"
+                if fallback_to_bf16:
+                    autocast_dtype = torch.bfloat16
+                    if rank == 0:
+                        logger.warning(
+                            "NPU FP16 AMP requested but GradScaler unavailable "
+                            f"(sources={npu_amp_sources}); switching to BF16 AMP."
+                        )
+                else:
+                    amp_enabled = False
+                    if rank == 0:
+                        logger.warning(
+                            "NPU FP16 AMP requested but GradScaler unavailable "
+                            f"(sources={npu_amp_sources}); disabling AMP."
+                        )
+
+        if rank == 0:
+            scaler_state = "on" if scaler is not None else "off"
+            logger.info(
+                f"AMP config: enabled={amp_enabled}, dtype={autocast_dtype}, scaler={scaler_state}"
+            )
 
         model.train()
         prefetcher = DataPrefetcher(
@@ -200,11 +287,18 @@ def train_worker(
 
             optimizer.zero_grad()
             if amp_enabled:
-                with torch.autocast(
-                    device_type=compat.device_type,
-                    dtype=autocast_dtype,
-                    enabled=True,
-                ):
+                if compat.is_npu:
+                    autocast_ctx = _build_npu_autocast_context(
+                        npu_autocast_fn, autocast_dtype
+                    )
+                else:
+                    autocast_ctx = torch.autocast(
+                        device_type=compat.device_type,
+                        dtype=autocast_dtype,
+                        enabled=True,
+                    )
+
+                with autocast_ctx:
                     logits: Tensor = model(x)  # type: ignore
                     loss = nn.functional.cross_entropy(
                         logits.view(-1, logits.size(-1)), y.view(-1)
@@ -228,6 +322,14 @@ def train_worker(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
             scheduler.step()
+
+            # Guard: detect divergence early to trigger retry logic upstream
+            if rank == 0:
+                loss_value = loss.item()
+                if not (loss_value == loss_value) or loss_value > loss_guard:
+                    raise RuntimeError(
+                        f"LOSS_DIVERGED: loss={loss_value:.4f} guard={loss_guard:.4f}"
+                    )
 
             if rank == 0 and ((step + 1) % log_interval == 0 or step == num_steps - 1):
                 last_loss = loss.item()
@@ -313,6 +415,11 @@ class Trainer:
                         "memory_allocation_failure",
                         "npu out of memory",
                     ]
+                    if "loss_diverged" in msg:
+                        logger.warning(
+                            "Trainer worker detected loss divergence. Propagating for retry."
+                        )
+                        break
                     if any(k in msg for k in oom_keywords):
                         logger.warning(
                             "Trainer worker failed with OOM error. Propagating up."

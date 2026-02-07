@@ -22,10 +22,12 @@ shutdown_event = threading.Event()
 active_sessions = weakref.WeakSet()
 
 # Constants
-API_URL = "http://localhost:8000/loss"
-STATUS_URL = "http://localhost:8000/status"
-PREVIOUS_RUNS_URL = "http://localhost:8000/previous_runs"
-API_KEY = "chinchilla_method2_sweep_key"
+API_URL = os.getenv("SWEEP_API_URL", "http://localhost:8000/loss")
+STATUS_URL = os.getenv("SWEEP_STATUS_URL", "http://localhost:8000/status")
+PREVIOUS_RUNS_URL = os.getenv(
+    "SWEEP_PREVIOUS_RUNS_URL", "http://localhost:8000/previous_runs"
+)
+API_KEY = os.getenv("SWEEP_API_KEY", "chinchilla_method2_sweep_key")
 
 # Global lock for results file access
 results_lock = Lock()
@@ -83,6 +85,8 @@ def get_loss(config: Dict[str, Any]) -> float:
 
                 if response.status_code in [404, 403]:
                     logger.error(f"Fatal error {response.status_code}: {response.text}")
+                    if response.status_code == 403:
+                        shutdown_event.set()
                     return float("nan")
 
                 # If 500 or 503, we fall through to the wait logic
@@ -133,6 +137,10 @@ class SweepScheduler:
         self.df_sweep = pd.read_csv(csv_path, dtype={"dataset": str})
         self.results = []
         self.completed_keys = set()
+        self.local_capacity_check = os.getenv("SWEEP_LOCAL_CAPACITY_CHECK", "0") == "1"
+        self.precheck_wait_seconds = max(
+            1, int(os.getenv("SWEEP_PRECHECK_WAIT_SECONDS", "10"))
+        )
         self.load_results()
 
     def load_results(self):
@@ -208,33 +216,37 @@ class SweepScheduler:
             "dataset": dataset,
         }
 
-        est_mem = self.estimate_job_memory(row)
+        if self.local_capacity_check:
+            est_mem = self.estimate_job_memory(row)
 
-        # Capacity Pre-check: Check shutdown_event in loop
-        while not shutdown_event.is_set():
-            try:
-                status = requests.get(STATUS_URL, timeout=10).json()
-                avail = status.get("available_capacity_gb", 0)
-                if avail >= est_mem:
-                    break
+            # Optional client-side capacity gate.
+            # Default is OFF because server-side admission control is more accurate.
+            while not shutdown_event.is_set():
+                try:
+                    status = requests.get(STATUS_URL, timeout=10).json()
+                    avail = status.get("available_capacity_gb", 0)
+                    if avail >= est_mem:
+                        break
 
-                logger.info(
-                    f"Local pre-check: Insufficient capacity for N={n_params:.1e} "
-                    f"(Need {est_mem:.1f}GB, Have {avail:.1f}GB). Waiting..."
-                )
+                    logger.info(
+                        f"Local pre-check: Insufficient capacity for N={n_params:.1e} "
+                        f"(Need {est_mem:.1f}GB, Have {avail:.1f}GB). Waiting..."
+                    )
 
-                # Check event during long wait simulation
-                for _ in range(7):  # 7 * 10s = 70s wait equivalent
-                    if shutdown_event.is_set():
-                        return
-                    try:
-                        # Use short wait to be responsive
-                        requests.get(f"{STATUS_URL}?wait=true", timeout=10)
-                    except Exception:
-                        pass
+                    # Check event during wait simulation
+                    for _ in range(max(1, 70 // self.precheck_wait_seconds)):
+                        if shutdown_event.is_set():
+                            return
+                        try:
+                            requests.get(
+                                f"{STATUS_URL}?wait=true",
+                                timeout=self.precheck_wait_seconds,
+                            )
+                        except Exception:
+                            pass
 
-            except Exception:
-                time.sleep(5)
+                except Exception:
+                    time.sleep(5)
 
         if shutdown_event.is_set():
             return
@@ -336,7 +348,15 @@ def process_directory(directory: str, max_concurrent: int = 4):
 
         logger.info(f"=== Starting Sweep: {csv_file} ===")
         csv_path = os.path.join(directory, csv_file)
-        results_file = os.path.join(directory, "results.json")
+        base = os.path.splitext(csv_file)[0]
+        default_results = os.path.join(directory, "results.json")
+        per_csv_results = os.path.join(directory, f"results_{base}.json")
+        if os.path.exists(per_csv_results):
+            results_file = per_csv_results
+        elif os.path.exists(default_results):
+            results_file = default_results
+        else:
+            results_file = per_csv_results
         scheduler = SweepScheduler(csv_path, results_file)
         scheduler.run(max_concurrent=max_concurrent)
 
@@ -345,9 +365,10 @@ if __name__ == "__main__":
     import argparse
     import signal
 
+    default_concurrent = int(os.getenv("SWEEP_DEFAULT_CONCURRENT", "8"))
     parser = argparse.ArgumentParser()
     parser.add_argument("directory", help="Directory with CSV files")
-    parser.add_argument("--concurrent", type=int, default=4)
+    parser.add_argument("--concurrent", type=int, default=default_concurrent)
     args = parser.parse_args()
 
     # Graceful Shutdown Handling

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import math
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from multiprocessing import shared_memory
@@ -56,19 +57,23 @@ app_state = {
 
 class ResourceManager:
     def __init__(self, safe_threshold: float = 0.85):
-        self.default_threshold = safe_threshold
+        env_threshold = float(os.getenv("TRAINING_MEMORY_THRESHOLD", str(safe_threshold)))
+        self.default_threshold = max(0.1, min(0.98, env_threshold))
         self.current_threshold = safe_threshold
         self.active_jobs: Dict[str, Dict[str, Any]] = {}
         self.lock = asyncio.Condition()
         self.last_oom_time = 0.0
         self.oom_cooldown = 60  # 60s cooldown after OOM
         self.dynamic_overhead_factor = 1.0  # Adaptive safety margin
+        self.startup_grace_seconds = float(
+            os.getenv("TRAINING_STARTUP_GRACE_SECONDS", "8.0")
+        )
         self.device_count = compat.device_count()
         self.free_devices = set(range(self.device_count))
 
-    def estimate_memory_gb(self, config: Dict[str, Any]) -> float:
+    def estimate_memory_gb(self, config: Dict[str, Any], group_size: int) -> float:
         """
-        Estimate memory usage in GB.
+        Estimate per-device memory usage in GB.
         Formula: Params (float16) + Gradients (float16) + Opt states (AdamW, float32)
         Plus some overhead for activations and buffers.
         N = 12 * num_layers * d_model^2
@@ -84,18 +89,45 @@ class ResourceManager:
         # Activations: very rough estimate based on batch_size and context_length
         # This is a guestimate, can be refined.
         batch_size = config["batch_size"]
+        local_batch = max(1, int(math.ceil(batch_size / max(1, group_size))))
         context_length = CONTEXT_LENGTH
         # Rough activation factor: d_model * context_length * batch_size * layers * factor
         # For simplicity, let's say 2x model memory or a base overhead.
         activation_overhead = (
-            batch_size * context_length * d_model * num_layers * 4 * 4
+            local_batch * context_length * d_model * num_layers * 4 * 4
         ) / (1024**3)
 
         # Apply dynamic overhead factor to activation estimate
         total_est = (
-            model_mem_gb + (activation_overhead * self.dynamic_overhead_factor) + 0.5
+            model_mem_gb + (activation_overhead * self.dynamic_overhead_factor) + 0.25
         )
         return total_est
+
+    def _snapshot_device_memory(self, target_threshold: float) -> Dict[int, Dict[str, float]]:
+        per_device: Dict[int, Dict[str, float]] = {}
+        for d in range(self.device_count):
+            info = compat.get_memory_info(d)
+            total_mem = float(info["total"])
+            allocated_mem = float(info["allocated"])
+            threshold_capacity = total_mem * target_threshold
+            available_mem = max(0.0, threshold_capacity - allocated_mem)
+            per_device[d] = {
+                "total": total_mem,
+                "allocated": allocated_mem,
+                "threshold_capacity": threshold_capacity,
+                "available": available_mem,
+            }
+        return per_device
+
+    def _pending_startup_by_device(self, now: float) -> Dict[int, float]:
+        pending_by_device: Dict[int, float] = {}
+        for job in self.active_jobs.values():
+            if (now - float(job.get("started_at", now + 1))) >= self.startup_grace_seconds:
+                continue
+            est_mem = float(job.get("est_mem_per_device", job.get("est_mem", 0.0)))
+            for d in job.get("devices", []):
+                pending_by_device[d] = pending_by_device.get(d, 0.0) + est_mem
+        return pending_by_device
 
     async def acquire(
         self, job_id: str, config: Dict[str, Any], group_size: int
@@ -124,52 +156,58 @@ class ResourceManager:
                         f"System stable. Adaptive overhead factor refined to {self.dynamic_overhead_factor:.2f}"
                     )
 
-                est_mem = self.estimate_memory_gb(config)
+                est_mem = self.estimate_memory_gb(config, group_size=group_size)
                 in_cooldown = (now - self.last_oom_time) < self.oom_cooldown
                 target_threshold = self.default_threshold * (
                     0.8 if in_cooldown else 1.0
                 )
 
-                mem_info = compat.get_memory_info()
-                current_allocated = mem_info["allocated"]
-                total_mem = mem_info["total"]
-
-                if total_mem > 0:
-                    capacity_total = total_mem * target_threshold
-                    available_capacity = capacity_total - current_allocated
-
-                    # Startup Lag Protection:
-                    # Subtract memory of jobs that started very recently (< 5s)
-                    # because their memory might not yet be reflected in mem_get_info()
-                    pending_startup_mem = sum(
-                        job["est_mem"]
-                        for job in self.active_jobs.values()
-                        if (now - job["started_at"]) < 5.0
+                if self.device_count > 0:
+                    per_device = self._snapshot_device_memory(target_threshold)
+                    pending_by_device = self._pending_startup_by_device(now)
+                    free_devices_sorted = sorted(
+                        self.free_devices,
+                        key=lambda d: per_device.get(d, {}).get("available", 0.0),
+                        reverse=True,
                     )
+                    candidate_devices = free_devices_sorted[:group_size]
+                    if len(candidate_devices) < group_size:
+                        await self.lock.wait()
+                        continue
 
-                    # We treat pending memory as "already taken" from the *available* capacity
-                    # This is conservative but safe.
-                    adjusted_available = available_capacity - pending_startup_mem
+                    can_schedule = True
+                    for d in candidate_devices:
+                        adjusted_available = (
+                            per_device[d]["available"] - pending_by_device.get(d, 0.0)
+                        )
+                        if adjusted_available < est_mem:
+                            can_schedule = False
+                            break
 
-                    if adjusted_available >= est_mem:
-                        devices: list[int] = []
-                        if self.device_count > 0:
-                            for d in sorted(self.free_devices)[:group_size]:
-                                devices.append(d)
-                                self.free_devices.remove(d)
+                    if can_schedule:
+                        for d in candidate_devices:
+                            self.free_devices.remove(d)
 
                         self.active_jobs[job_id] = {
                             "est_mem": est_mem,
+                            "est_mem_per_device": est_mem,
                             "started_at": now,
                             "config": config,  # Keep config for debugging/recovery
-                            "devices": devices,
+                            "devices": candidate_devices,
                             "group_size": group_size,
                         }
-                        logger.info(
-                            f"Job {job_id} scheduled. Est: {est_mem:.2f}GB (Factor: {self.dynamic_overhead_factor:.2f}), "
-                            f"NPU: {current_allocated:.1f}/{total_mem:.1f}GB, Available: {available_capacity:.1f}GB"
+                        free_pool_adjusted = sum(
+                            max(
+                                0.0,
+                                per_device[d]["available"] - pending_by_device.get(d, 0.0),
+                            )
+                            for d in self.free_devices
                         )
-                        return devices
+                        logger.info(
+                            f"Job {job_id} scheduled. Est/device: {est_mem:.2f}GB (Factor: {self.dynamic_overhead_factor:.2f}), "
+                            f"group_size={group_size}, devices={candidate_devices}, free_pool_adjusted={free_pool_adjusted:.1f}GB"
+                        )
+                        return candidate_devices
                 else:
                     # CPU mode or unknown? Fallback to sequential for safety
                     if not self.active_jobs:
@@ -201,22 +239,42 @@ class ResourceManager:
                 self.lock.notify_all()
 
     def get_status(self) -> Dict[str, Any]:
-        mem_info = compat.get_memory_info()
         now = asyncio.get_event_loop().time()
         in_cooldown = (now - self.last_oom_time) < self.oom_cooldown
         target_threshold = self.default_threshold * (0.8 if in_cooldown else 1.0)
 
-        total_mem = mem_info["total"]
-        current_allocated = mem_info["allocated"]
-        available_capacity = max(0, total_mem * target_threshold - current_allocated)
+        if self.device_count > 0:
+            per_device = self._snapshot_device_memory(target_threshold)
+            total_mem = sum(v["total"] for v in per_device.values())
+            current_allocated = sum(v["allocated"] for v in per_device.values())
+            available_capacity = sum(
+                per_device[d]["available"] for d in self.free_devices if d in per_device
+            )
+            per_device_rows = [
+                {
+                    "device_id": d,
+                    "total_gb": round(v["total"], 2),
+                    "allocated_gb": round(v["allocated"], 2),
+                    "available_gb": round(v["available"], 2),
+                    "is_free": d in self.free_devices,
+                }
+                for d, v in sorted(per_device.items())
+            ]
+        else:
+            mem_info = compat.get_memory_info()
+            total_mem = mem_info["total"]
+            current_allocated = mem_info["allocated"]
+            available_capacity = max(0, total_mem * target_threshold - current_allocated)
+            per_device_rows = []
 
         return {
             "active_tasks": len(self.active_jobs),
-            "total_memory_gb": total_mem,
-            "allocated_memory_gb": current_allocated,
+            "total_memory_gb": round(total_mem, 2),
+            "allocated_memory_gb": round(current_allocated, 2),
             "available_capacity_gb": round(available_capacity, 2),
             "device_count": self.device_count,
             "free_devices": sorted(self.free_devices),
+            "per_device_memory_gb": per_device_rows,
             "is_in_cooldown": in_cooldown,
             "cooldown_remaining": max(0, self.oom_cooldown - (now - self.last_oom_time))
             if in_cooldown
@@ -339,21 +397,37 @@ def get_job_id(api_key: str, config: Dict[str, Any]) -> str:
 
 
 def _parse_group_sizes() -> list[int]:
-    raw = os.getenv("TRAINING_GROUP_SIZES", "1,2,4")
-    sizes: list[int] = []
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            sizes.append(int(part))
-        except ValueError:
-            continue
-    if not sizes:
-        sizes = [1, 2, 4]
-    sizes = sorted(set(s for s in sizes if s > 0))
+    raw = os.getenv("TRAINING_GROUP_SIZES", "").strip()
     max_devices = max(1, compat.device_count())
-    return [s for s in sizes if s <= max_devices]
+    if raw:
+        raw_sizes: list[int] = []
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                raw_sizes.append(int(part))
+            except ValueError:
+                continue
+    else:
+        if compat.is_npu and max_devices >= 4:
+            # Prioritize 2-way DDP to fill 4 cards with two concurrent models.
+            raw_sizes = [2, 1, 4]
+        else:
+            raw_sizes = [1, 2, 4]
+
+    sizes: list[int] = []
+    seen = set()
+    for s in raw_sizes:
+        if s <= 0 or s > max_devices or s in seen:
+            continue
+        sizes.append(s)
+        seen.add(s)
+
+    if not sizes:
+        return [1]
+
+    return sizes
 
 
 def _is_oom_error(error_msg: str) -> bool:
@@ -367,6 +441,59 @@ def _is_oom_error(error_msg: str) -> bool:
         "npu out of memory",
     ]
     return any(k in msg for k in oom_keywords)
+
+
+def _apply_stability_policy(config: Dict[str, Any]) -> Dict[str, Any]:
+    mode = os.getenv("TRAINING_STABILITY_MODE", "proactive").lower()
+    if mode == "off":
+        return dict(config)
+
+    cfg = dict(config)
+    L = int(cfg.get("num_layers", 0))
+    d = int(cfg.get("d_model", 0))
+    lr = float(cfg.get("learning_rate", 0.0))
+
+    risk = 0
+    if L >= 16:
+        risk += 1
+    if L >= 20:
+        risk += 1
+    if d <= 192:
+        risk += 1
+    if d <= 160:
+        risk += 1
+    if lr >= 5e-4:
+        risk += 1
+    if lr >= 6e-4:
+        risk += 1
+
+    lr_scale = 1.0
+    if risk >= 2:
+        lr_scale = 0.5
+    if risk >= 3:
+        lr_scale = 0.25
+    if risk >= 4:
+        lr_scale = 0.2
+
+    if lr_scale < 1.0:
+        new_lr = max(1e-4, lr * lr_scale)
+        cfg["learning_rate"] = new_lr
+
+    if compat.is_npu and risk >= 2:
+        cfg["amp_enabled_override"] = True
+        cfg["amp_dtype_override"] = "bf16"
+
+    # Stricter guard for high-risk configs
+    if risk >= 3:
+        cfg["loss_guard_override"] = 12.0
+
+    if lr_scale < 1.0 or cfg.get("amp_dtype_override") or cfg.get("loss_guard_override"):
+        logger.info(
+            f"Stability policy applied: risk={risk}, lr={lr:.2e}->{cfg['learning_rate']:.2e}, "
+            f"amp={cfg.get('amp_dtype_override','default')}, guard={cfg.get('loss_guard_override','default')}"
+        )
+
+    return cfg
 
 
 async def guardian_task():
@@ -506,8 +633,43 @@ async def get_loss(
                 logger.info(
                     f"Job {job_id} attempting group_size={group_size} devices={device_ids}"
                 )
-                # Run training in worker process via mp.spawn
-                loss = await run_in_threadpool(trainer.train, config, device_ids)
+                # Proactive stability policy (single attempt by default)
+                cfg = _apply_stability_policy(config)
+                enable_fallback = os.getenv("TRAINING_ENABLE_FALLBACK", "0") == "1"
+
+                if not enable_fallback:
+                    loss = await run_in_threadpool(trainer.train, cfg, device_ids)
+                else:
+                    # Optional fallback chain if explicitly enabled
+                    attempt_configs = [
+                        ("stable", cfg),
+                        (
+                            "lr_x0.5_bf16",
+                            {
+                                **cfg,
+                                "learning_rate": max(1e-4, cfg["learning_rate"] * 0.5),
+                                "amp_enabled_override": True,
+                                "amp_dtype_override": "bf16",
+                            },
+                        ),
+                    ]
+                    loss = None
+                    for tag, attempt_cfg in attempt_configs:
+                        try:
+                            logger.info(f"Job {job_id} stability_attempt={tag}")
+                            loss = await run_in_threadpool(
+                                trainer.train, attempt_cfg, device_ids
+                            )
+                            break
+                        except Exception as inner_e:
+                            if "loss_diverged" in str(inner_e).lower():
+                                logger.warning(
+                                    f"Job {job_id} divergence detected on attempt={tag}; retrying fallback."
+                                )
+                                continue
+                            raise
+                    if loss is None:
+                        raise RuntimeError("LOSS_DIVERGED: all stability attempts failed")
 
                 # Record success
                 db.update_run_status(run_id, "SUCCESS", loss=loss)
@@ -519,6 +681,13 @@ async def get_loss(
             except Exception as e:
                 error_msg = str(e)
                 last_error = e
+                if "loss_diverged" in error_msg.lower():
+                    logger.warning(
+                        f"Job {job_id} failed due to loss divergence at group_size={group_size}. "
+                        f"Trying larger group if available."
+                    )
+                    if idx < len(group_sizes) - 1:
+                        continue
                 if _is_oom_error(error_msg):
                     logger.warning(
                         f"Job {job_id} hit OOM at group_size={group_size}. "
