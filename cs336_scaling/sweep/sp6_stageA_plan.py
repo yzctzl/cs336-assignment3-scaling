@@ -39,15 +39,6 @@ BASELINE_LR_BY_LAYER = {
     16: 3e-4,
 }
 
-STAGE_B_BUDGETS = [1e16, 3e16, 6e16]
-STAGE_B_RULES = {
-    1e16: {"n_mult": [0.9, 1.0, 1.1], "lr_mult": [0.9, 1.0], "layer_offsets": [0]},
-    3e16: {"n_mult": [0.9, 1.0, 1.1], "lr_mult": [0.9, 1.0], "layer_offsets": [0]},
-    6e16: {"n_mult": [0.9, 1.0, 1.1], "lr_mult": [0.9, 1.0], "layer_offsets": [0]},
-}
-DEFAULT_STAGE_B_TOP_K = 1
-
-
 def budget_label(budget: float) -> str:
     return f"{budget:.0e}".replace("+", "")
 
@@ -203,89 +194,19 @@ def recover_stage_a_arch(stage_a_df: pd.DataFrame, result: Dict[str, float]) -> 
     return int(row["layers"]), int(row["d_model"]), float(row["LR"])
 
 
-def get_stage_b_layer_candidates(
-    base_layer: int,
-    budget: float,
-    layer_offsets: List[int],
-    max_no_layer_expand_budget: float,
-) -> List[int]:
-    candidates: List[int] = []
-    for off in layer_offsets:
-        cand = int(base_layer + off)
-        if budget <= max_no_layer_expand_budget and cand != base_layer:
-            continue
-        if cand in MIN_D_BY_LAYER:
-            candidates.append(cand)
-    if base_layer in MIN_D_BY_LAYER and base_layer not in candidates:
-        candidates.append(base_layer)
-    return sorted(set(candidates))
-
-
-def build_stage_b_for_budget(
-    budget: float,
-    out_dir: str,
-    stage_a_df: pd.DataFrame,
-    stage_b_top_k: int,
-    max_no_layer_expand_budget: float,
-) -> pd.DataFrame:
-    runs = load_stage_a_results(out_dir, budget)
-    if not runs:
-        return pd.DataFrame()
-
-    top = sorted(runs, key=lambda r: float(r["loss"]))[: max(1, int(stage_b_top_k))]
-    rules = STAGE_B_RULES[budget]
-    rows: List[Dict[str, float]] = []
-    seen = set()
-    for base in top:
-        layer, _base_d, base_lr = recover_stage_a_arch(stage_a_df, base)
-        layers = get_stage_b_layer_candidates(
-            base_layer=layer,
-            budget=budget,
-            layer_offsets=list(rules.get("layer_offsets", [0])),
-            max_no_layer_expand_budget=max_no_layer_expand_budget,
-        )
-        for layer_cand in layers:
-            min_d = MIN_D_BY_LAYER[layer_cand]
-            for n_mult in rules["n_mult"]:
-                target_n_non_emb = float(base["N"]) * n_mult
-                d = solve_d_model_from_n_non_emb(target_n_non_emb, layer_cand)
-                if d < min_d:
-                    d = min_d
-                for lr_mult in rules["lr_mult"]:
-                    lr = max(1e-4, min(1e-3, base_lr * lr_mult))
-                    key = (layer_cand, d, round(lr, 12))
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    rows.append(compute_row(budget, layer_cand, d, lr))
-
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows).drop_duplicates(subset=["layers", "d_model", "LR"])
-    df = df.sort_values("N_non_emb").reset_index(drop=True)
-    return df
-
-
-def estimate_total_flops(stage_a: Dict[float, pd.DataFrame], stage_b: Dict[float, pd.DataFrame]) -> float:
+def estimate_total_flops(stage_a: Dict[float, pd.DataFrame]) -> float:
     total = 0.0
     for budget, df in stage_a.items():
-        total += budget * len(df)
-    for budget, df in stage_b.items():
         total += budget * len(df)
     return total
 
 
-def write_csvs(out_dir: str, stage_a: Dict[float, pd.DataFrame], stage_b: Dict[float, pd.DataFrame]) -> None:
+def write_csvs(out_dir: str, stage_a: Dict[float, pd.DataFrame]) -> None:
     os.makedirs(out_dir, exist_ok=True)
     for budget, df in stage_a.items():
         if df.empty:
             continue
         name = f"sp6_stageA_{budget_label(budget)}_budget.csv"
-        df.to_csv(os.path.join(out_dir, name), index=False)
-    for budget, df in stage_b.items():
-        if df.empty:
-            continue
-        name = f"sp6_stageB_{budget_label(budget)}_budget.csv"
         df.to_csv(os.path.join(out_dir, name), index=False)
 
 
@@ -293,7 +214,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--out-dir",
-        default="artifacts/chinchilla_sweep/sp6_method2_nightly",
+        default="artifacts/chinchilla_sweep/sp6",
         help="Output directory for stage csv files",
     )
     parser.add_argument(
@@ -330,17 +251,6 @@ def main() -> None:
         help="Upper D/N target for Stage A candidate generation",
     )
     parser.add_argument(
-        "--emit-stage-b",
-        action="store_true",
-        help="Generate Stage B files from existing Stage A results in out-dir",
-    )
-    parser.add_argument(
-        "--stage-b-top-k",
-        type=int,
-        default=DEFAULT_STAGE_B_TOP_K,
-        help="Use top-K Stage A minima as Stage B anchors per budget",
-    )
-    parser.add_argument(
         "--max-no-layer-expand-budget",
         type=float,
         default=1e16,
@@ -368,42 +278,18 @@ def main() -> None:
                 raise RuntimeError(f"Stage A N_non_emb not monotonic for budget {budget}")
         stage_a[budget] = df
 
-    stage_b: Dict[float, pd.DataFrame] = {}
-    if args.emit_stage_b:
-        for budget in STAGE_B_BUDGETS:
-            if budget not in budgets:
-                continue
-            stage_b[budget] = build_stage_b_for_budget(
-                budget=budget,
-                out_dir=args.out_dir,
-                stage_a_df=stage_a[budget],
-                stage_b_top_k=args.stage_b_top_k,
-                max_no_layer_expand_budget=args.max_no_layer_expand_budget,
-            )
-
-    total_est = estimate_total_flops(stage_a, stage_b)
+    total_est = estimate_total_flops(stage_a)
     if total_est > args.target_flops:
         raise SystemExit(
             f"Refusing to write files: estimated FLOPs {total_est:.3e} exceeds cap {args.target_flops:.3e}"
         )
 
-    write_csvs(args.out_dir, stage_a, stage_b)
+    write_csvs(args.out_dir, stage_a)
 
     print("Stage A summary:")
     for budget in budgets:
         df = stage_a.get(budget, pd.DataFrame())
         print(f"  C={budget_label(budget)} runs={len(df)}")
-    if args.emit_stage_b:
-        print("Stage B summary:")
-        for budget in STAGE_B_BUDGETS:
-            if budget not in budgets:
-                continue
-            df = stage_b.get(budget, pd.DataFrame())
-            print(f"  C={budget_label(budget)} runs={len(df)}")
-        print(
-            "  policy: no layer expansion for budgets <= "
-            f"{budget_label(args.max_no_layer_expand_budget)}"
-        )
     print(f"Estimated total FLOPs: {total_est:.3e}")
 
 

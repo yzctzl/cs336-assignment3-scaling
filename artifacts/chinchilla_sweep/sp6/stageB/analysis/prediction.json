@@ -1,0 +1,95 @@
+{
+  "target_budget": 1e+19,
+  "filters": {
+    "loss_hard_cap": 20.0,
+    "iqr_enabled": true,
+    "num_raw_points": 126,
+    "num_dedup_points": 126,
+    "num_dedup_removed": 0,
+    "num_filtered_points": 123,
+    "num_removed_points": 3,
+    "allow_missing_csv": false,
+    "dedup_enabled": true,
+    "quadratic_envelope_enabled": true,
+    "monotonic_nopt_enabled": true,
+    "input_dirs": [
+      "artifacts/chinchilla_sweep/sp6/stageA",
+      "artifacts/chinchilla_sweep/sp6/stageB"
+    ],
+    "output_dir": "artifacts/chinchilla_sweep/sp6/stageB"
+  },
+  "empirical": {
+    "fit": {
+      "k": 285.61907442895205,
+      "a": 0.2546131977971307
+    },
+    "prediction": {
+      "N_opt": 19653412.32203444,
+      "D_opt": 84802915613.69635
+    },
+    "candidate_architectures": [
+      {
+        "layers": 10,
+        "d_model": 408,
+        "N_non_emb_actual": 19975680,
+        "abs_error_to_pred": 322267.67796555907
+      },
+      {
+        "layers": 12,
+        "d_model": 368,
+        "N_non_emb_actual": 19501056,
+        "abs_error_to_pred": 152356.32203444093
+      },
+      {
+        "layers": 14,
+        "d_model": 344,
+        "N_non_emb_actual": 19880448,
+        "abs_error_to_pred": 227035.67796555907
+      },
+      {
+        "layers": 16,
+        "d_model": 320,
+        "N_non_emb_actual": 19660800,
+        "abs_error_to_pred": 7387.677965559065
+      }
+    ],
+    "nopt_adjusted_count_for_fit": 3
+  },
+  "quadratic": {
+    "fit": {
+      "k": 6601.683656526695,
+      "a": 0.1874014136466449
+    },
+    "prediction": {
+      "N_opt": 24003886.743900992,
+      "D_opt": 69433199900.01787
+    },
+    "candidate_architectures": [
+      {
+        "layers": 10,
+        "d_model": 448,
+        "N_non_emb_actual": 24084480,
+        "abs_error_to_pred": 80593.25609900802
+      },
+      {
+        "layers": 12,
+        "d_model": 408,
+        "N_non_emb_actual": 23970816,
+        "abs_error_to_pred": 33070.743900991976
+      },
+      {
+        "layers": 14,
+        "d_model": 376,
+        "N_non_emb_actual": 23751168,
+        "abs_error_to_pred": 252718.74390099198
+      },
+      {
+        "layers": 16,
+        "d_model": 352,
+        "N_non_emb_actual": 23789568,
+        "abs_error_to_pred": 214318.74390099198
+      }
+    ],
+    "nopt_adjusted_count_for_fit": 0
+  }
+}
