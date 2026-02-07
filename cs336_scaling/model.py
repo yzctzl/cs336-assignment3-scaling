@@ -7,6 +7,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint as checkpoint
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,7 @@ class BasicsTransformerLM(nn.Module):
         d_ff: int,
         attn_pdrop: Optional[float] = None,
         residual_pdrop: Optional[float] = None,
+        use_checkpoint: bool = False,
     ):
         # Store the model configuration for serialization / deserialization
         self.config = {
@@ -76,6 +78,7 @@ class BasicsTransformerLM(nn.Module):
         self.ln_final = nn.LayerNorm(d_model, bias=False)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         self.residual_pdrop = residual_pdrop
+        self.use_checkpoint = use_checkpoint
         # report number of parameters
         logger.info(
             "number of non-embedding parameters: %.2fM" % (self.get_num_params() / 1e6,)
@@ -121,7 +124,13 @@ class BasicsTransformerLM(nn.Module):
             x = F.dropout(x, self.residual_pdrop)
         for layer in self.layers:
             # (batch size, sequence_length, d_model)
-            x = layer(x)
+            if self.use_checkpoint and self.training:
+                try:
+                    x = checkpoint.checkpoint(layer, x, use_reentrant=False)
+                except TypeError:
+                    x = checkpoint.checkpoint(layer, x)
+            else:
+                x = layer(x)
         # (batch size, sequence_length, d_model)
         x = self.ln_final(x)
         # (batch size, sequence_length, vocab_size)

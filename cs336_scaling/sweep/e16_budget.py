@@ -3,12 +3,20 @@ import os
 import numpy as np
 import pandas as pd
 
+VOCAB_SIZE = 32000
+NUM_HEADS = 8
 
-def generate_fixed_layer_sweep(budget=6e15, L=6, num_points=18, lr = 4e-4, dn_min = 11, dn_max = 180):
-    VOCAB_SIZE = 10000
-    # BATCH_SIZE = 128
-    LEARNING_RATE = lr
-    NUM_HEADS = 8
+
+def generate_fixed_layer_sweep(
+    budget=6e15, L=6, num_points=18, lr=4e-4, dn_min=11, dn_max=180
+):
+
+    # Previous analysis showed 4e-4 caused instability (Loss~7.8) for some N.
+    # We use a geometric spread:
+    # 2e-4: Safe harbor (stability)
+    # 4e-4: Previous baseline (performance)
+    # 6e-4: Aggressive (for smallest N)
+    learning_rates = [2e-4, 4e-4, 6e-4]
 
     # Range of D/N (Total) from 11 to 180
     n_total_min = np.sqrt(budget / (6 * dn_max))
@@ -39,35 +47,40 @@ def generate_fixed_layer_sweep(budget=6e15, L=6, num_points=18, lr = 4e-4, dn_mi
         tokens = budget / (6 * n_total)
         dn_ratio = tokens / n_total
 
-        plan.append(
-            {
-                "Budget": f"{budget:.0e}",
-                "layers": L,
-                "d_model": d_model,
-                "heads": NUM_HEADS,
-                # "batch_size": BATCH_SIZE,
-                "LR": LEARNING_RATE,
-                "N_non_emb": int(n_non_emb),
-                "N_emb": int(n_total - n_non_emb),
-                "N": int(n_total),
-                "D_N_ratio": round(dn_ratio, 2),
-                "Tokens": float(f"{tokens:.2e}"),
-                "dataset": "sp6",
-            }
-        )
+        for lr in learning_rates:
+            plan.append(
+                {
+                    "Budget": f"{budget:.0e}",
+                    "layers": L,
+                    "d_model": d_model,
+                    "heads": NUM_HEADS,
+                    # "batch_size": BATCH_SIZE,
+                    "LR": lr,
+                    "N_non_emb": int(n_non_emb),
+                    "N_emb": int(n_total - n_non_emb),
+                    "N": int(n_total),
+                    "D_N_ratio": round(dn_ratio, 2),
+                    "Tokens": float(f"{tokens:.2e}"),
+                    "dataset": "sp6",
+                }
+            )
 
     df = pd.DataFrame(plan)
-    # Drop duplicate d_models to keep exactly one point per distinct architecture
+    # Drop duplicate (d_model, LR) pairs
     df = (
-        df.drop_duplicates(subset=["d_model"])
-        .sort_values("d_model")
+        df.drop_duplicates(subset=["d_model", "LR"])
+        .sort_values(["d_model", "LR"])
         .reset_index(drop=True)
     )
 
-    # If we have too many points, sample them evenly to reach target
-    if len(df) > num_points:
-        indices = np.linspace(0, len(df) - 1, num_points).astype(int)
-        df = df.iloc[indices].reset_index(drop=True)
+    # If we have too many points, sample distinct architectures then explode LRs
+    # Ideally we keep all LRs for sampled architecture.
+    unique_d_models = df["d_model"].unique()
+    if len(unique_d_models) > num_points:
+        # Sample architectures
+        indices = np.linspace(0, len(unique_d_models) - 1, num_points).astype(int)
+        selected_d_models = unique_d_models[indices]
+        df = df[df["d_model"].isin(selected_d_models)].reset_index(drop=True)  # pyright: ignore[reportArgumentType]
 
     return df
 
@@ -79,7 +92,7 @@ os.makedirs(f"artifacts/chinchilla_sweep/{BUDGET}", exist_ok=True)
 df_fixed.to_csv(f"artifacts/chinchilla_sweep/{BUDGET}/{BUDGET}_budget.csv", index=False)
 
 print(
-    df_fixed[["layers", "d_model", "N_non_emb", "N", "D_N_ratio"]].to_string(
+    df_fixed[["layers", "d_model", "N_non_emb", "N", "D_N_ratio"]].to_string(  # pyright: ignore[reportAttributeAccessIssue]
         index=False
     )
 )

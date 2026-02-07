@@ -63,6 +63,8 @@ class ResourceManager:
         self.last_oom_time = 0.0
         self.oom_cooldown = 60  # 60s cooldown after OOM
         self.dynamic_overhead_factor = 1.0  # Adaptive safety margin
+        self.device_count = compat.device_count()
+        self.free_devices = set(range(self.device_count))
 
     def estimate_memory_gb(self, config: Dict[str, Any]) -> float:
         """
@@ -95,9 +97,20 @@ class ResourceManager:
         )
         return total_est
 
-    async def acquire(self, job_id: str, config: Dict[str, Any]):
+    async def acquire(
+        self, job_id: str, config: Dict[str, Any], group_size: int
+    ) -> list[int]:
         async with self.lock:
             while True:
+                # If running on accelerators, enforce device group availability.
+                if self.device_count > 0:
+                    if len(self.free_devices) < group_size:
+                        logger.info(
+                            f"Job {job_id} waiting for device group (need {group_size}, free {len(self.free_devices)})..."
+                        )
+                        await self.lock.wait()
+                        continue
+
                 now = asyncio.get_event_loop().time()
                 # Proactive factor decay: Reduce if 10 mins have passed since last OOM
                 if (
@@ -139,21 +152,33 @@ class ResourceManager:
                     adjusted_available = available_capacity - pending_startup_mem
 
                     if adjusted_available >= est_mem:
+                        devices: list[int] = []
+                        if self.device_count > 0:
+                            for d in sorted(self.free_devices)[:group_size]:
+                                devices.append(d)
+                                self.free_devices.remove(d)
+
                         self.active_jobs[job_id] = {
                             "est_mem": est_mem,
                             "started_at": now,
                             "config": config,  # Keep config for debugging/recovery
+                            "devices": devices,
+                            "group_size": group_size,
                         }
                         logger.info(
                             f"Job {job_id} scheduled. Est: {est_mem:.2f}GB (Factor: {self.dynamic_overhead_factor:.2f}), "
                             f"NPU: {current_allocated:.1f}/{total_mem:.1f}GB, Available: {available_capacity:.1f}GB"
                         )
-                        return
+                        return devices
                 else:
                     # CPU mode or unknown? Fallback to sequential for safety
                     if not self.active_jobs:
-                        self.active_jobs[job_id] = {"est_mem": 0.0, "started_at": now}
-                        return
+                        self.active_jobs[job_id] = {
+                            "est_mem": 0.0,
+                            "started_at": now,
+                            "devices": [],
+                        }
+                        return []
 
                 await self.lock.wait()
 
@@ -169,6 +194,9 @@ class ResourceManager:
     async def release(self, job_id: str):
         async with self.lock:
             if job_id in self.active_jobs:
+                devices = self.active_jobs[job_id].get("devices", [])
+                for d in devices:
+                    self.free_devices.add(d)
                 del self.active_jobs[job_id]
                 self.lock.notify_all()
 
@@ -187,6 +215,8 @@ class ResourceManager:
             "total_memory_gb": total_mem,
             "allocated_memory_gb": current_allocated,
             "available_capacity_gb": round(available_capacity, 2),
+            "device_count": self.device_count,
+            "free_devices": sorted(self.free_devices),
             "is_in_cooldown": in_cooldown,
             "cooldown_remaining": max(0, self.oom_cooldown - (now - self.last_oom_time))
             if in_cooldown
@@ -308,6 +338,37 @@ def get_job_id(api_key: str, config: Dict[str, Any]) -> str:
     return f"{api_key}_{config_str}"
 
 
+def _parse_group_sizes() -> list[int]:
+    raw = os.getenv("TRAINING_GROUP_SIZES", "1,2,4")
+    sizes: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            sizes.append(int(part))
+        except ValueError:
+            continue
+    if not sizes:
+        sizes = [1, 2, 4]
+    sizes = sorted(set(s for s in sizes if s > 0))
+    max_devices = max(1, compat.device_count())
+    return [s for s in sizes if s <= max_devices]
+
+
+def _is_oom_error(error_msg: str) -> bool:
+    msg = error_msg.lower()
+    oom_keywords = [
+        "out of memory",
+        "acl api failed",
+        "failed to allocate",
+        "tried to allocate",
+        "memory_allocation_failure",
+        "npu out of memory",
+    ]
+    return any(k in msg for k in oom_keywords)
+
+
 async def guardian_task():
     """Background task to ensure system health and resource cleanup."""
     logger.info("Guardian task started.")
@@ -420,27 +481,33 @@ async def get_loss(
     logger.info(f"Job {job_id} requesting resources...")
 
     async def run_training():
-        await resource_manager.acquire(job_id, config)
-        try:
-            # Double check inside the lock for existing results (prevents redundant work from near-simultaneous requests)
-            existing_loss = db.get_existing_run(api_key, config)
-            if existing_loss is not None:
-                total_used = db.get_total_flops(api_key)
-                logger.info(
-                    f"Job {job_id} found existing result in DB after acquiring resources. Skipping."
-                )
-                return {"loss": existing_loss, "total_flops_used": total_used}
-
-            # Initialize Job Tracking
-            run_id = db.initialize_run(api_key, config)
+        # Double check inside the lock for existing results (prevents redundant work from near-simultaneous requests)
+        existing_loss = db.get_existing_run(api_key, config)
+        if existing_loss is not None:
+            total_used = db.get_total_flops(api_key)
             logger.info(
-                f"Job {job_id} (run_id: {run_id}) started training on {DEVICE_TYPE}."
+                f"Job {job_id} found existing result in DB after acquiring resources. Skipping."
             )
-            db.update_run_status(run_id, "RUNNING")
+            return {"loss": existing_loss, "total_flops_used": total_used}
 
+        # Initialize Job Tracking
+        run_id = db.initialize_run(api_key, config)
+        logger.info(
+            f"Job {job_id} (run_id: {run_id}) started training on {DEVICE_TYPE}."
+        )
+        db.update_run_status(run_id, "RUNNING")
+
+        group_sizes = _parse_group_sizes()
+        last_error: Exception | None = None
+
+        for idx, group_size in enumerate(group_sizes):
+            device_ids = await resource_manager.acquire(job_id, config, group_size)
             try:
+                logger.info(
+                    f"Job {job_id} attempting group_size={group_size} devices={device_ids}"
+                )
                 # Run training in worker process via mp.spawn
-                loss = await run_in_threadpool(trainer.train, config)
+                loss = await run_in_threadpool(trainer.train, config, device_ids)
 
                 # Record success
                 db.update_run_status(run_id, "SUCCESS", loss=loss)
@@ -451,16 +518,18 @@ async def get_loss(
 
             except Exception as e:
                 error_msg = str(e)
-                if "out of memory" in error_msg.lower():
-                    # Simplified logging for OOM as requested
+                last_error = e
+                if _is_oom_error(error_msg):
                     logger.warning(
-                        f"Job {job_id} hit NPU OOM. Triggering adaptive backoff."
+                        f"Job {job_id} hit OOM at group_size={group_size}. "
+                        f"Trying larger group if available."
                     )
                     resource_manager.report_oom()
+                    if idx < len(group_sizes) - 1:
+                        continue
                     db.update_run_status(
                         run_id, "FAILED", error_message="NPU out of memory"
                     )
-                    # Signal client to retry with 503
                     raise HTTPException(
                         status_code=503,
                         detail="NPU out of memory, please retry later",
@@ -472,8 +541,11 @@ async def get_loss(
                 raise HTTPException(status_code=500, detail=error_msg)
             finally:
                 compat.empty_cache()
-        finally:
-            await resource_manager.release(job_id)
+                await resource_manager.release(job_id)
+
+        if last_error is not None:
+            raise last_error
+        return {"loss": float("nan"), "total_flops_used": db.get_total_flops(api_key)}
 
     # Use shield to ensure training completes even if client disconnects
     return await asyncio.shield(run_training())

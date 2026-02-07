@@ -1,4 +1,3 @@
-import functools
 import logging
 import os
 import socket
@@ -10,17 +9,10 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-)
-from torch.distributed.fsdp import (
-    MixedPrecision,
-    ShardingStrategy,
-)
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.types import Tensor
 
-from cs336_scaling.model import BasicsTransformerLM, TransformerBlock
+from cs336_scaling.model import BasicsTransformerLM
 
 from .compat import DEVICE_TYPE, compat
 from .dataload import DataPrefetcher
@@ -34,12 +26,24 @@ def find_free_port() -> str:
         return str(s.getsockname()[1])
 
 
+def is_port_conflict_error(err: Exception) -> bool:
+    msg = str(err).lower()
+    port_markers = [
+        "address already in use",
+        "eaddrinuse",
+        "bind the ip port",
+        "port have been bound already",
+        "failed to bind the ip port",
+        "ej0003",
+    ]
+    return any(m in msg for m in port_markers)
+
+
 def setup_distributed(rank: int, world_size: int, port: str):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = port
     backend = compat.get_dist_backend()
     dist.init_process_group(backend, rank=rank, world_size=world_size)
-    compat.set_device(rank)
 
 
 def cleanup_distributed():
@@ -56,19 +60,34 @@ def train_worker(
     shm_info: Optional[Dict[str, Any]],
     vocab_size: int,
     context_length: int,
+    device_ids: Optional[list[int]],
     return_dict: Dict[int, float],
 ):
     model: Optional[nn.Module] = None
     optimizer: Optional[torch.optim.Optimizer] = None
     shm = None
     try:
-        if world_size > 1:
-            setup_distributed(rank, world_size, port)
+        device_id: Optional[int] = None
+        if device_ids:
+            device_id = device_ids[rank]
+            compat.set_device(device_id)
         else:
-            # Still set the device for single-process isolated run
             compat.set_device(rank)
 
-        device = compat.get_device(rank)
+        if world_size > 1:
+            setup_distributed(rank, world_size, port)
+
+        if compat.device_count() > 0:
+            device = torch.device(f"{compat.device_type}:{device_id if device_id is not None else rank}")
+        else:
+            device = torch.device("cpu")
+
+        if compat.is_cuda:
+            torch.backends.cudnn.benchmark = True
+            try:
+                torch.set_float32_matmul_precision("high")
+            except Exception:
+                pass
 
         d_model = config["d_model"]
         num_layers = config["num_layers"]
@@ -82,6 +101,7 @@ def train_worker(
             local_batch_size = 1
 
         d_ff = 4 * d_model
+        use_checkpoint = os.getenv("TRAINING_GRAD_CHECKPOINT", "0") == "1"
         model = BasicsTransformerLM(
             vocab_size=vocab_size,
             context_length=context_length,
@@ -91,26 +111,20 @@ def train_worker(
             d_ff=d_ff,
             attn_pdrop=0.1,
             residual_pdrop=0.1,
+            use_checkpoint=use_checkpoint,
         ).to(device)
 
         if world_size > 1:
-            # FSDP for maximizing model size
-            model = FSDP(
-                model,
-                sharding_strategy=ShardingStrategy.FULL_SHARD,
-                auto_wrap_policy=functools.partial(
-                    transformer_auto_wrap_policy,
-                    transformer_layer_cls={TransformerBlock},
-                ),
-                mixed_precision=MixedPrecision(
-                    param_dtype=torch.float16,
-                    reduce_dtype=torch.float16,
-                    buffer_dtype=torch.float16,
-                )
-                if (compat.is_npu or compat.is_cuda)
-                else None,
-                device_id=device,
-            )
+            # Use DDP (no parameter sharding) for ZeRO-2-like behavior.
+            ddp_kwargs = {
+                "device_ids": [device_id] if device_id is not None else None,
+                "output_device": device_id if device_id is not None else None,
+                "broadcast_buffers": False,
+                "gradient_as_bucket_view": True,
+            }
+            if os.getenv("DDP_STATIC_GRAPH", "1") == "1":
+                ddp_kwargs["static_graph"] = True
+            model = DDP(model, **ddp_kwargs)
 
         compat.empty_cache()
 
@@ -152,6 +166,26 @@ def train_worker(
             optimizer, T_max=num_steps, eta_min=learning_rate / 10.0
         )
 
+        amp_enabled = (
+            os.getenv("TRAINING_AMP", "1") == "1"
+            and (compat.is_cuda or compat.is_npu)
+        )
+        amp_dtype = os.getenv("TRAINING_AMP_DTYPE", "fp16").lower()
+        if amp_dtype == "bf16":
+            autocast_dtype = torch.bfloat16
+        else:
+            autocast_dtype = torch.float16
+        scaler = None
+        if amp_enabled and compat.is_cuda:
+            scaler = torch.cuda.amp.GradScaler()
+        elif amp_enabled and compat.is_npu:
+            try:
+                from torch_npu.amp import GradScaler as NPUGradScaler  # type: ignore
+
+                scaler = NPUGradScaler()
+            except Exception:
+                scaler = None
+
         model.train()
         prefetcher = DataPrefetcher(
             data, local_batch_size, context_length, cpu_generator, device, num_steps
@@ -165,13 +199,34 @@ def train_worker(
                 break
 
             optimizer.zero_grad()
-            logits: Tensor = model(x)  # type: ignore
-            loss = nn.functional.cross_entropy(
-                logits.view(-1, logits.size(-1)), y.view(-1)
-            )
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            if amp_enabled:
+                with torch.autocast(
+                    device_type=compat.device_type,
+                    dtype=autocast_dtype,
+                    enabled=True,
+                ):
+                    logits: Tensor = model(x)  # type: ignore
+                    loss = nn.functional.cross_entropy(
+                        logits.view(-1, logits.size(-1)), y.view(-1)
+                    )
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+            else:
+                logits = model(x)  # type: ignore
+                loss = nn.functional.cross_entropy(
+                    logits.view(-1, logits.size(-1)), y.view(-1)
+                )
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
             scheduler.step()
 
             if rank == 0 and ((step + 1) % log_interval == 0 or step == num_steps - 1):
@@ -215,50 +270,64 @@ class Trainer:
             f"Trainer initialized for {DEVICE_TYPE} with world_size: {self.world_size}"
         )
 
-    def train(self, config: Dict[str, Any]) -> float:
+    def train(self, config: Dict[str, Any], device_ids: Optional[list[int]] = None) -> float:
         vocab_size = config.get("vocab_size", self.vocab_size)
         context_length = config.get("context_length", self.context_length)
 
         ctx = mp.get_context("spawn")
-        port = find_free_port()
+        world_size = len(device_ids) if device_ids else self.world_size
+        max_port_retries = 3
+        last_error: Optional[Exception] = None
 
-        with ctx.Manager() as manager:
-            return_dict = manager.dict()
-            try:
-                mp.spawn(  # type: ignore
-                    train_worker,
-                    args=(
-                        self.world_size,
-                        port,
-                        config,
-                        self.train_data_path,
-                        self.shm_info,
-                        vocab_size,
-                        context_length,
-                        return_dict,
-                    ),
-                    nprocs=self.world_size,
-                    join=True,
-                )
-            except Exception as e:
-                msg = str(e).lower()
-                # Expanded OOM detection keywords based on NPU error logs
-                oom_keywords = [
-                    "out of memory",
-                    "acl api failed",
-                    "failed to allocate",
-                    "tried to allocate",
-                    "memory_allocation_failure",
-                    "npu out of memory",
-                ]
-                if any(k in msg for k in oom_keywords):
-                    logger.warning(
-                        "Trainer worker failed with OOM error. Propagating up."
+        for attempt in range(1, max_port_retries + 1):
+            port = find_free_port()
+            with ctx.Manager() as manager:
+                return_dict = manager.dict()
+                try:
+                    mp.spawn(  # type: ignore
+                        train_worker,
+                        args=(
+                            world_size,
+                            port,
+                            config,
+                            self.train_data_path,
+                            self.shm_info,
+                            vocab_size,
+                            context_length,
+                            device_ids,
+                            return_dict,
+                        ),
+                        nprocs=world_size,
+                        join=True,
                     )
-                else:
+                    return return_dict.get(0, 0.0)
+                except Exception as e:
+                    last_error = e
+                    msg = str(e).lower()
+                    # Expanded OOM detection keywords based on NPU error logs
+                    oom_keywords = [
+                        "out of memory",
+                        "acl api failed",
+                        "failed to allocate",
+                        "tried to allocate",
+                        "memory_allocation_failure",
+                        "npu out of memory",
+                    ]
+                    if any(k in msg for k in oom_keywords):
+                        logger.warning(
+                            "Trainer worker failed with OOM error. Propagating up."
+                        )
+                        break
+                    if is_port_conflict_error(e) and attempt < max_port_retries:
+                        logger.warning(
+                            f"Distributed port conflict detected. Retrying with a new port (attempt {attempt + 1}/{max_port_retries})."
+                        )
+                        continue
                     logger.error(f"mp.spawn failed: {e}")
-                raise e
-            finally:
-                compat.empty_cache()
+                    break
+                finally:
+                    compat.empty_cache()
 
-            return return_dict.get(0, 0.0)
+        if last_error is not None:
+            raise last_error
+        return 0.0
