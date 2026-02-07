@@ -59,7 +59,7 @@ class ResourceManager:
     def __init__(self, safe_threshold: float = 0.85):
         env_threshold = float(os.getenv("TRAINING_MEMORY_THRESHOLD", str(safe_threshold)))
         self.default_threshold = max(0.1, min(0.98, env_threshold))
-        self.current_threshold = safe_threshold
+        self.current_threshold = self.default_threshold
         self.active_jobs: Dict[str, Dict[str, Any]] = {}
         self.lock = asyncio.Condition()
         self.last_oom_time = 0.0
@@ -69,7 +69,28 @@ class ResourceManager:
             os.getenv("TRAINING_STARTUP_GRACE_SECONDS", "8.0")
         )
         self.device_count = compat.device_count()
-        self.free_devices = set(range(self.device_count))
+        self.max_models_per_device = max(
+            1, int(os.getenv("TRAINING_MAX_MODELS_PER_DEVICE", "2"))
+        )
+        # Slot-based scheduling:
+        # - slots=1 allows packed jobs (e.g., 2 models on one card when max_models_per_device=2)
+        # - slots=max_models_per_device reserves a full device for one job
+        self.device_used_slots: Dict[int, int] = {
+            d: 0 for d in range(self.device_count)
+        }
+
+    def _normalize_slots_per_device(self, slots_per_device: int | None) -> int:
+        if slots_per_device is None:
+            return self.max_models_per_device
+        return max(1, min(self.max_models_per_device, int(slots_per_device)))
+
+    def _devices_with_slots(self, required_slots: int) -> list[int]:
+        return [
+            d
+            for d in range(self.device_count)
+            if self.device_used_slots.get(d, 0) + required_slots
+            <= self.max_models_per_device
+        ]
 
     def estimate_memory_gb(self, config: Dict[str, Any], group_size: int) -> float:
         """
@@ -130,15 +151,22 @@ class ResourceManager:
         return pending_by_device
 
     async def acquire(
-        self, job_id: str, config: Dict[str, Any], group_size: int
+        self,
+        job_id: str,
+        config: Dict[str, Any],
+        group_size: int,
+        slots_per_device: int | None = None,
     ) -> list[int]:
         async with self.lock:
             while True:
+                required_slots = self._normalize_slots_per_device(slots_per_device)
                 # If running on accelerators, enforce device group availability.
                 if self.device_count > 0:
-                    if len(self.free_devices) < group_size:
+                    slot_ready_devices = self._devices_with_slots(required_slots)
+                    if len(slot_ready_devices) < group_size:
                         logger.info(
-                            f"Job {job_id} waiting for device group (need {group_size}, free {len(self.free_devices)})..."
+                            f"Job {job_id} waiting for slots (need group={group_size}, "
+                            f"slots/device={required_slots}, ready_devices={len(slot_ready_devices)})..."
                         )
                         await self.lock.wait()
                         continue
@@ -165,8 +193,9 @@ class ResourceManager:
                 if self.device_count > 0:
                     per_device = self._snapshot_device_memory(target_threshold)
                     pending_by_device = self._pending_startup_by_device(now)
+                    slot_ready_devices = self._devices_with_slots(required_slots)
                     free_devices_sorted = sorted(
-                        self.free_devices,
+                        slot_ready_devices,
                         key=lambda d: per_device.get(d, {}).get("available", 0.0),
                         reverse=True,
                     )
@@ -186,7 +215,9 @@ class ResourceManager:
 
                     if can_schedule:
                         for d in candidate_devices:
-                            self.free_devices.remove(d)
+                            self.device_used_slots[d] = (
+                                self.device_used_slots.get(d, 0) + required_slots
+                            )
 
                         self.active_jobs[job_id] = {
                             "est_mem": est_mem,
@@ -195,17 +226,29 @@ class ResourceManager:
                             "config": config,  # Keep config for debugging/recovery
                             "devices": candidate_devices,
                             "group_size": group_size,
+                            "slots_per_device": required_slots,
                         }
+                        slot_ready_after = self._devices_with_slots(1)
                         free_pool_adjusted = sum(
                             max(
                                 0.0,
                                 per_device[d]["available"] - pending_by_device.get(d, 0.0),
                             )
-                            for d in self.free_devices
+                            for d in slot_ready_after
+                        )
+                        free_slots = sum(
+                            max(
+                                0,
+                                self.max_models_per_device
+                                - self.device_used_slots.get(d, 0),
+                            )
+                            for d in range(self.device_count)
                         )
                         logger.info(
                             f"Job {job_id} scheduled. Est/device: {est_mem:.2f}GB (Factor: {self.dynamic_overhead_factor:.2f}), "
-                            f"group_size={group_size}, devices={candidate_devices}, free_pool_adjusted={free_pool_adjusted:.1f}GB"
+                            f"group_size={group_size}, slots/device={required_slots}, "
+                            f"devices={candidate_devices}, free_slots={free_slots}, "
+                            f"free_pool_adjusted={free_pool_adjusted:.1f}GB"
                         )
                         return candidate_devices
                 else:
@@ -233,8 +276,15 @@ class ResourceManager:
         async with self.lock:
             if job_id in self.active_jobs:
                 devices = self.active_jobs[job_id].get("devices", [])
+                slots_per_device = int(
+                    self.active_jobs[job_id].get(
+                        "slots_per_device", self.max_models_per_device
+                    )
+                )
                 for d in devices:
-                    self.free_devices.add(d)
+                    self.device_used_slots[d] = max(
+                        0, self.device_used_slots.get(d, 0) - slots_per_device
+                    )
                 del self.active_jobs[job_id]
                 self.lock.notify_all()
 
@@ -248,7 +298,15 @@ class ResourceManager:
             total_mem = sum(v["total"] for v in per_device.values())
             current_allocated = sum(v["allocated"] for v in per_device.values())
             available_capacity = sum(
-                per_device[d]["available"] for d in self.free_devices if d in per_device
+                per_device[d]["available"]
+                * (
+                    max(
+                        0,
+                        self.max_models_per_device - self.device_used_slots.get(d, 0),
+                    )
+                    / self.max_models_per_device
+                )
+                for d in per_device
             )
             per_device_rows = [
                 {
@@ -256,16 +314,31 @@ class ResourceManager:
                     "total_gb": round(v["total"], 2),
                     "allocated_gb": round(v["allocated"], 2),
                     "available_gb": round(v["available"], 2),
-                    "is_free": d in self.free_devices,
+                    "slots_total": self.max_models_per_device,
+                    "slots_used": self.device_used_slots.get(d, 0),
+                    "slots_free": max(
+                        0,
+                        self.max_models_per_device - self.device_used_slots.get(d, 0),
+                    ),
+                    "is_free": self.device_used_slots.get(d, 0) == 0,
                 }
                 for d, v in sorted(per_device.items())
             ]
+            fully_free_devices = [
+                d for d in range(self.device_count) if self.device_used_slots.get(d, 0) == 0
+            ]
+            free_slots_total = sum(
+                max(0, self.max_models_per_device - self.device_used_slots.get(d, 0))
+                for d in range(self.device_count)
+            )
         else:
             mem_info = compat.get_memory_info()
             total_mem = mem_info["total"]
             current_allocated = mem_info["allocated"]
             available_capacity = max(0, total_mem * target_threshold - current_allocated)
             per_device_rows = []
+            fully_free_devices = []
+            free_slots_total = 0
 
         return {
             "active_tasks": len(self.active_jobs),
@@ -273,7 +346,9 @@ class ResourceManager:
             "allocated_memory_gb": round(current_allocated, 2),
             "available_capacity_gb": round(available_capacity, 2),
             "device_count": self.device_count,
-            "free_devices": sorted(self.free_devices),
+            "free_devices": fully_free_devices,
+            "free_slots_total": free_slots_total,
+            "max_models_per_device": self.max_models_per_device,
             "per_device_memory_gb": per_device_rows,
             "is_in_cooldown": in_cooldown,
             "cooldown_remaining": max(0, self.oom_cooldown - (now - self.last_oom_time))
@@ -410,11 +485,7 @@ def _parse_group_sizes() -> list[int]:
             except ValueError:
                 continue
     else:
-        if compat.is_npu and max_devices >= 4:
-            # Prioritize 2-way DDP to fill 4 cards with two concurrent models.
-            raw_sizes = [2, 1, 4]
-        else:
-            raw_sizes = [1, 2, 4]
+        raw_sizes = [1, 2, 4]
 
     sizes: list[int] = []
     seen = set()
@@ -428,6 +499,79 @@ def _parse_group_sizes() -> list[int]:
         return [1]
 
     return sizes
+
+
+def _parse_bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "1" if default else "0").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _parse_float_env(name: str, default: float, low: float, high: float) -> float:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return max(low, min(high, value))
+
+
+def _should_try_packed_single_card(
+    config: Dict[str, Any], manager: ResourceManager
+) -> bool:
+    if manager.device_count <= 0 or manager.max_models_per_device <= 1:
+        return False
+    if not _parse_bool_env("TRAINING_ENABLE_PACKED_SINGLE_CARD", True):
+        return False
+
+    # Only pack jobs whose estimated usage is clearly below a single-card budget.
+    est_mem = manager.estimate_memory_gb(config, group_size=1)
+    packed_ratio = _parse_float_env(
+        "TRAINING_PACKED_MAX_MEMORY_RATIO", default=0.45, low=0.2, high=0.8
+    )
+    probe_mem = compat.get_memory_info(0)
+    packed_cap = float(probe_mem["total"]) * manager.default_threshold * packed_ratio
+    return est_mem <= packed_cap
+
+
+def _build_schedule_attempts(
+    config: Dict[str, Any], manager: ResourceManager
+) -> list[Dict[str, Any]]:
+    attempts: list[Dict[str, Any]] = []
+    seen = set()
+
+    if _should_try_packed_single_card(config, manager):
+        attempts.append(
+            {
+                "group_size": 1,
+                "slots_per_device": 1,
+                "policy": "packed_single_card",
+            }
+        )
+        seen.add((1, 1))
+
+    exclusive_slots = manager.max_models_per_device
+    for group_size in _parse_group_sizes():
+        key = (group_size, exclusive_slots)
+        if key in seen:
+            continue
+        attempts.append(
+            {
+                "group_size": group_size,
+                "slots_per_device": exclusive_slots,
+                "policy": "exclusive_group",
+            }
+        )
+        seen.add(key)
+
+    if not attempts:
+        attempts.append(
+            {
+                "group_size": 1,
+                "slots_per_device": exclusive_slots,
+                "policy": "exclusive_group",
+            }
+        )
+    return attempts
 
 
 def _is_oom_error(error_msg: str) -> bool:
@@ -494,6 +638,42 @@ def _apply_stability_policy(config: Dict[str, Any]) -> Dict[str, Any]:
         )
 
     return cfg
+
+
+async def _train_with_stability_fallback(
+    trainer: Trainer, config: Dict[str, Any], device_ids: list[int], job_id: str
+) -> float:
+    # Keep one clear entrypoint for stability logic so scheduling code stays compact.
+    cfg = _apply_stability_policy(config)
+    enable_fallback = os.getenv("TRAINING_ENABLE_FALLBACK", "0") == "1"
+
+    if not enable_fallback:
+        return float(await run_in_threadpool(trainer.train, cfg, device_ids))
+
+    attempt_configs = [
+        ("stable", cfg),
+        (
+            "lr_x0.5_bf16",
+            {
+                **cfg,
+                "learning_rate": max(1e-4, cfg["learning_rate"] * 0.5),
+                "amp_enabled_override": True,
+                "amp_dtype_override": "bf16",
+            },
+        ),
+    ]
+    for tag, attempt_cfg in attempt_configs:
+        try:
+            logger.info(f"Job {job_id} stability_attempt={tag}")
+            return float(await run_in_threadpool(trainer.train, attempt_cfg, device_ids))
+        except Exception as inner_e:
+            if "loss_diverged" in str(inner_e).lower():
+                logger.warning(
+                    f"Job {job_id} divergence detected on attempt={tag}; retrying fallback."
+                )
+                continue
+            raise
+    raise RuntimeError("LOSS_DIVERGED: all stability attempts failed")
 
 
 async def guardian_task():
@@ -624,52 +804,27 @@ async def get_loss(
         )
         db.update_run_status(run_id, "RUNNING")
 
-        group_sizes = _parse_group_sizes()
+        schedule_attempts = _build_schedule_attempts(config, resource_manager)
         last_error: Exception | None = None
 
-        for idx, group_size in enumerate(group_sizes):
-            device_ids = await resource_manager.acquire(job_id, config, group_size)
+        for idx, attempt in enumerate(schedule_attempts):
+            group_size = int(attempt["group_size"])
+            slots_per_device = int(attempt["slots_per_device"])
+            policy = str(attempt["policy"])
+            device_ids = await resource_manager.acquire(
+                job_id,
+                config,
+                group_size=group_size,
+                slots_per_device=slots_per_device,
+            )
             try:
                 logger.info(
-                    f"Job {job_id} attempting group_size={group_size} devices={device_ids}"
+                    f"Job {job_id} attempting policy={policy}, group_size={group_size}, "
+                    f"slots/device={slots_per_device}, devices={device_ids}"
                 )
-                # Proactive stability policy (single attempt by default)
-                cfg = _apply_stability_policy(config)
-                enable_fallback = os.getenv("TRAINING_ENABLE_FALLBACK", "0") == "1"
-
-                if not enable_fallback:
-                    loss = await run_in_threadpool(trainer.train, cfg, device_ids)
-                else:
-                    # Optional fallback chain if explicitly enabled
-                    attempt_configs = [
-                        ("stable", cfg),
-                        (
-                            "lr_x0.5_bf16",
-                            {
-                                **cfg,
-                                "learning_rate": max(1e-4, cfg["learning_rate"] * 0.5),
-                                "amp_enabled_override": True,
-                                "amp_dtype_override": "bf16",
-                            },
-                        ),
-                    ]
-                    loss = None
-                    for tag, attempt_cfg in attempt_configs:
-                        try:
-                            logger.info(f"Job {job_id} stability_attempt={tag}")
-                            loss = await run_in_threadpool(
-                                trainer.train, attempt_cfg, device_ids
-                            )
-                            break
-                        except Exception as inner_e:
-                            if "loss_diverged" in str(inner_e).lower():
-                                logger.warning(
-                                    f"Job {job_id} divergence detected on attempt={tag}; retrying fallback."
-                                )
-                                continue
-                            raise
-                    if loss is None:
-                        raise RuntimeError("LOSS_DIVERGED: all stability attempts failed")
+                loss = await _train_with_stability_fallback(
+                    trainer, config, device_ids, job_id
+                )
 
                 # Record success
                 db.update_run_status(run_id, "SUCCESS", loss=loss)
@@ -683,18 +838,19 @@ async def get_loss(
                 last_error = e
                 if "loss_diverged" in error_msg.lower():
                     logger.warning(
-                        f"Job {job_id} failed due to loss divergence at group_size={group_size}. "
-                        f"Trying larger group if available."
+                        f"Job {job_id} failed due to loss divergence at policy={policy}, "
+                        f"group_size={group_size}, slots/device={slots_per_device}. "
+                        f"Trying next schedule attempt if available."
                     )
-                    if idx < len(group_sizes) - 1:
+                    if idx < len(schedule_attempts) - 1:
                         continue
                 if _is_oom_error(error_msg):
                     logger.warning(
-                        f"Job {job_id} hit OOM at group_size={group_size}. "
-                        f"Trying larger group if available."
+                        f"Job {job_id} hit OOM at policy={policy}, group_size={group_size}, "
+                        f"slots/device={slots_per_device}. Trying next schedule attempt if available."
                     )
                     resource_manager.report_oom()
-                    if idx < len(group_sizes) - 1:
+                    if idx < len(schedule_attempts) - 1:
                         continue
                     db.update_run_status(
                         run_id, "FAILED", error_message="NPU out of memory"
