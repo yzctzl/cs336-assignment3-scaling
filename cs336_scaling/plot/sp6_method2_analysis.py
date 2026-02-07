@@ -3,7 +3,7 @@ import json
 import math
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -70,15 +70,45 @@ def compute_row(budget: float, layers: int, d_model: int, lr: float) -> Dict[str
     }
 
 
-def load_runs(results_dir: str) -> pd.DataFrame:
+def _find_matching_csv(results_dir: str, base: str) -> Optional[str]:
+    candidates = [
+        f"{base}.csv",
+        f"{base}_budget.csv",
+    ]
+    if base.endswith("_budget"):
+        candidates.append(f"{base[:-7]}.csv")
+    for name in candidates:
+        path = os.path.join(results_dir, name)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def load_runs_from_dir(results_dir: str, require_csv_match: bool) -> pd.DataFrame:
     rows: List[Dict[str, float]] = []
+    if not os.path.isdir(results_dir):
+        return pd.DataFrame(
+            columns=[
+                "source_dir",
+                "source_file",
+                "C",
+                "N_non_emb",
+                "LR",
+                "loss",
+                "layers",
+                "d_model",
+            ]
+        )
+
     for file_name in sorted(os.listdir(results_dir)):
         if not file_name.startswith("results_") or not file_name.endswith(".json"):
             continue
         result_path = os.path.join(results_dir, file_name)
         base = file_name[len("results_") : -len(".json")]
-        csv_path = os.path.join(results_dir, f"{base}.csv")
-        csv_df = pd.read_csv(csv_path) if os.path.exists(csv_path) else pd.DataFrame()
+        csv_path = _find_matching_csv(results_dir, base)
+        if require_csv_match and csv_path is None:
+            continue
+        csv_df = pd.read_csv(csv_path) if csv_path else pd.DataFrame()
 
         with open(result_path, "r") as f:
             runs = json.load(f)
@@ -86,6 +116,15 @@ def load_runs(results_dir: str) -> pd.DataFrame:
         for r in runs:
             if r.get("dataset") != "sp6":
                 continue
+            if not isinstance(r.get("loss"), (int, float)):
+                continue
+            if not isinstance(r.get("C"), (int, float)):
+                continue
+            if not isinstance(r.get("N"), (int, float)):
+                continue
+            if not isinstance(r.get("LR"), (int, float)):
+                continue
+
             loss = float(r["loss"])
             c = float(r["C"])
             n_non_emb = float(r["N"])
@@ -108,6 +147,7 @@ def load_runs(results_dir: str) -> pd.DataFrame:
 
             rows.append(
                 {
+                    "source_dir": results_dir,
                     "source_file": file_name,
                     "C": c,
                     "N_non_emb": n_non_emb,
@@ -117,12 +157,58 @@ def load_runs(results_dir: str) -> pd.DataFrame:
                     "d_model": d_model,
                 }
             )
+
     if not rows:
         return pd.DataFrame(
-            columns=["source_file", "C", "N_non_emb", "LR", "loss", "layers", "d_model"]
+            columns=[
+                "source_dir",
+                "source_file",
+                "C",
+                "N_non_emb",
+                "LR",
+                "loss",
+                "layers",
+                "d_model",
+            ]
         )
     df = pd.DataFrame(rows)
     return df.sort_values(["C", "N_non_emb"]).reset_index(drop=True)
+
+
+def load_runs(input_dirs: List[str], require_csv_match: bool) -> pd.DataFrame:
+    parts = [load_runs_from_dir(d, require_csv_match=require_csv_match) for d in input_dirs]
+    parts = [p for p in parts if not p.empty]
+    if not parts:
+        return pd.DataFrame(
+            columns=[
+                "source_dir",
+                "source_file",
+                "C",
+                "N_non_emb",
+                "LR",
+                "loss",
+                "layers",
+                "d_model",
+            ]
+        )
+    df = pd.concat(parts, ignore_index=True)
+    return df.sort_values(["C", "N_non_emb"]).reset_index(drop=True)
+
+
+def deduplicate_runs(df: pd.DataFrame, enabled: bool) -> Tuple[pd.DataFrame, int]:
+    if not enabled:
+        return df.copy(), 0
+    before = len(df)
+    out = df.drop_duplicates(subset=["C", "N_non_emb", "LR", "loss"]).copy()
+    return out.sort_values(["C", "N_non_emb"]).reset_index(drop=True), before - len(out)
+
+
+def enforce_monotonic_nopt(summary_df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
+    out = summary_df.sort_values("C").copy()
+    adjusted = np.maximum.accumulate(out["N_opt"].astype(float).values)
+    changed = int(np.sum(~np.isclose(adjusted, out["N_opt"].astype(float).values)))
+    out["N_opt_for_fit"] = adjusted
+    return out, changed
 
 
 def apply_filters(df: pd.DataFrame, loss_hard_cap: float, use_iqr: bool) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -178,11 +264,23 @@ def method2_empirical(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def method2_quadratic(df: pd.DataFrame, empirical_df: pd.DataFrame) -> pd.DataFrame:
+def method2_quadratic(
+    df: pd.DataFrame, empirical_df: pd.DataFrame, use_envelope: bool
+) -> pd.DataFrame:
     rows = []
     empirical_by_c = {float(r["C"]): r for _, r in empirical_df.iterrows()}
     for c, g in df.groupby("C"):
-        g = g.sort_values("N_non_emb")
+        g_all = g.sort_values("N_non_emb")
+        if use_envelope:
+            g = (
+                g_all.sort_values("loss")
+                .groupby("N_non_emb", as_index=False)
+                .first()
+                .sort_values("N_non_emb")
+            )
+        else:
+            g = g_all
+
         if len(g) < 3:
             e = empirical_by_c[float(c)]
             rows.append(
@@ -248,7 +346,7 @@ def method2_quadratic(df: pd.DataFrame, empirical_df: pd.DataFrame) -> pd.DataFr
                 "LR_opt": float(nearest["LR"]),
                 "layers_opt": int(nearest["layers"]) if pd.notna(nearest["layers"]) else np.nan,
                 "d_model_opt": int(nearest["d_model"]) if pd.notna(nearest["d_model"]) else np.nan,
-                "source": "quadratic_vertex",
+                "source": "quadratic_vertex_envelope" if use_envelope else "quadratic_vertex_all_points",
             }
         )
 
@@ -391,7 +489,9 @@ def plot_isoflops_empirical(df: pd.DataFrame, empirical: pd.DataFrame, out_path:
     plt.close()
 
 
-def plot_isoflops_quadratic(df: pd.DataFrame, quadratic: pd.DataFrame, out_path: str) -> None:
+def plot_isoflops_quadratic(
+    df: pd.DataFrame, quadratic: pd.DataFrame, out_path: str, use_envelope: bool
+) -> None:
     plt.figure(figsize=(10, 6))
     budgets = sorted(df["C"].unique())
     cmap = plt.cm.plasma(np.linspace(0, 1, len(budgets)))
@@ -400,8 +500,17 @@ def plot_isoflops_quadratic(df: pd.DataFrame, quadratic: pd.DataFrame, out_path:
         g = df[df["C"] == c].sort_values("N_non_emb")
         plt.scatter(g["N_non_emb"], g["loss"], s=28, color=color[c], alpha=0.55)
         if len(g) >= 3:
-            x = np.log10(g["N_non_emb"].values)
-            y = g["loss"].values
+            if use_envelope:
+                g_fit = (
+                    g.sort_values("loss")
+                    .groupby("N_non_emb", as_index=False)
+                    .first()
+                    .sort_values("N_non_emb")
+                )
+            else:
+                g_fit = g
+            x = np.log10(g_fit["N_non_emb"].values)
+            y = g_fit["loss"].values
             a, b, c0 = np.polyfit(x, y, 2)
             x_line = np.linspace(x.min(), x.max(), 120)
             y_line = a * x_line * x_line + b * x_line + c0
@@ -473,7 +582,22 @@ def main() -> None:
     parser.add_argument(
         "--results-dir",
         default="artifacts/chinchilla_sweep/sp6_method2_nightly",
-        help="Directory containing results_*.json and corresponding csv files",
+        help="Single input directory containing results_*.json and corresponding csv files",
+    )
+    parser.add_argument(
+        "--stage-a-dir",
+        default=None,
+        help="Optional Stage A directory (used together with --stage-b-dir)",
+    )
+    parser.add_argument(
+        "--stage-b-dir",
+        default=None,
+        help="Optional Stage B directory; when provided and --output-dir is omitted, outputs go here",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Output root directory; analysis files are written into <output-dir>/analysis",
     )
     parser.add_argument(
         "--target-budget",
@@ -523,6 +647,26 @@ def main() -> None:
         default="0.9,1.0",
         help="Multipliers around baseline LR for large-scale validation plan",
     )
+    parser.add_argument(
+        "--allow-missing-csv",
+        action="store_true",
+        help="Allow loading result files without a matched csv (not recommended)",
+    )
+    parser.add_argument(
+        "--no-dedup",
+        action="store_true",
+        help="Disable exact de-duplication on (C, N_non_emb, LR, loss)",
+    )
+    parser.add_argument(
+        "--no-quadratic-envelope",
+        action="store_true",
+        help="Fit quadratic curve using all points instead of best-loss envelope per N",
+    )
+    parser.add_argument(
+        "--no-monotonic-nopt",
+        action="store_true",
+        help="Disable monotonic constraint for N_opt(C) before power-law fit",
+    )
     args = parser.parse_args()
 
     validation_budgets = parse_float_list(args.validation_budgets)
@@ -530,26 +674,68 @@ def main() -> None:
     high_budget_layers = parse_int_list(args.high_budget_layers)
     validation_n_mult = parse_float_list(args.validation_n_mult)
     validation_lr_mult = parse_float_list(args.validation_lr_mult)
+    use_quadratic_envelope = not args.no_quadratic_envelope
+    use_dedup = not args.no_dedup
+    use_monotonic_nopt = not args.no_monotonic_nopt
 
-    os.makedirs(args.results_dir, exist_ok=True)
+    if args.stage_a_dir or args.stage_b_dir:
+        input_dirs = [d for d in [args.stage_a_dir, args.stage_b_dir] if d]
+        if args.output_dir:
+            output_dir = args.output_dir
+        elif args.stage_b_dir:
+            output_dir = args.stage_b_dir
+        else:
+            output_dir = args.stage_a_dir
+    else:
+        input_dirs = [args.results_dir]
+        output_dir = args.output_dir or args.results_dir
 
-    raw = load_runs(args.results_dir)
+    if not input_dirs:
+        print("No input directory provided.")
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+    analysis_dir = os.path.join(output_dir, "analysis")
+    os.makedirs(analysis_dir, exist_ok=True)
+
+    raw = load_runs(
+        input_dirs=input_dirs,
+        require_csv_match=not args.allow_missing_csv,
+    )
     if raw.empty:
         print("No sp6 result files found; nothing to analyze.")
         return
 
+    deduped, num_dedup_removed = deduplicate_runs(raw, enabled=use_dedup)
+
     filtered, removed = apply_filters(
-        raw, loss_hard_cap=args.loss_hard_cap, use_iqr=not args.no_iqr_filter
+        deduped, loss_hard_cap=args.loss_hard_cap, use_iqr=not args.no_iqr_filter
     )
     if filtered.empty:
         print("All points were filtered out; adjust thresholds.")
         return
 
     empirical = method2_empirical(filtered)
-    quadratic = method2_quadratic(filtered, empirical)
+    quadratic = method2_quadratic(
+        filtered, empirical, use_envelope=use_quadratic_envelope
+    )
 
-    fit_emp = fit_power_law(empirical["C"].values, empirical["N_opt"].values)
-    fit_quad = fit_power_law(quadratic["C"].values, quadratic["N_opt"].values)
+    empirical_for_fit, emp_adjusted = enforce_monotonic_nopt(empirical)
+    quadratic_for_fit, quad_adjusted = enforce_monotonic_nopt(quadratic)
+    if not use_monotonic_nopt:
+        empirical_for_fit = empirical.copy()
+        empirical_for_fit["N_opt_for_fit"] = empirical_for_fit["N_opt"]
+        quadratic_for_fit = quadratic.copy()
+        quadratic_for_fit["N_opt_for_fit"] = quadratic_for_fit["N_opt"]
+        emp_adjusted = 0
+        quad_adjusted = 0
+
+    fit_emp = fit_power_law(
+        empirical_for_fit["C"].values, empirical_for_fit["N_opt_for_fit"].values
+    )
+    fit_quad = fit_power_law(
+        quadratic_for_fit["C"].values, quadratic_for_fit["N_opt_for_fit"].values
+    )
 
     pred_emp_n = float(fit_emp.predict(args.target_budget))
     pred_quad_n = float(fit_quad.predict(args.target_budget))
@@ -558,7 +744,7 @@ def main() -> None:
         ["method", "C"]
     )
     summary.to_csv(
-        os.path.join(args.results_dir, "analysis", "summary.csv"),
+        os.path.join(analysis_dir, "summary.csv"),
         index=False,
     )
 
@@ -572,8 +758,16 @@ def main() -> None:
             "loss_hard_cap": args.loss_hard_cap,
             "iqr_enabled": not args.no_iqr_filter,
             "num_raw_points": int(len(raw)),
+            "num_dedup_points": int(len(deduped)),
+            "num_dedup_removed": int(num_dedup_removed),
             "num_filtered_points": int(len(filtered)),
             "num_removed_points": int(len(removed)),
+            "allow_missing_csv": bool(args.allow_missing_csv),
+            "dedup_enabled": bool(use_dedup),
+            "quadratic_envelope_enabled": bool(use_quadratic_envelope),
+            "monotonic_nopt_enabled": bool(use_monotonic_nopt),
+            "input_dirs": input_dirs,
+            "output_dir": output_dir,
         },
         "empirical": {
             "fit": {"k": fit_emp.k, "a": fit_emp.a},
@@ -582,6 +776,7 @@ def main() -> None:
                 "D_opt": args.target_budget / (6 * pred_emp_n),
             },
             "candidate_architectures": build_candidate_architectures(pred_emp_n),
+            "nopt_adjusted_count_for_fit": int(emp_adjusted),
         },
         "quadratic": {
             "fit": {"k": fit_quad.k, "a": fit_quad.a},
@@ -590,9 +785,10 @@ def main() -> None:
                 "D_opt": args.target_budget / (6 * pred_quad_n),
             },
             "candidate_architectures": build_candidate_architectures(pred_quad_n),
+            "nopt_adjusted_count_for_fit": int(quad_adjusted),
         },
     }
-    with open(os.path.join(args.results_dir, "analysis", "prediction.json"), "w") as f:
+    with open(os.path.join(analysis_dir, "prediction.json"), "w") as f:
         json.dump(prediction, f, indent=2)
 
     validation = {
@@ -603,10 +799,13 @@ def main() -> None:
         "high_budget_layers": high_budget_layers,
         "validation_n_mult": validation_n_mult,
         "validation_lr_mult": validation_lr_mult,
+        "dedup_removed": int(num_dedup_removed),
+        "quadratic_envelope_enabled": bool(use_quadratic_envelope),
+        "monotonic_nopt_enabled": bool(use_monotonic_nopt),
         "empirical": holdout_emp,
         "quadratic": holdout_quad,
     }
-    with open(os.path.join(args.results_dir, "analysis", "validation.json"), "w") as f:
+    with open(os.path.join(analysis_dir, "validation.json"), "w") as f:
         json.dump(validation, f, indent=2)
 
     large_emp = build_large_scale_validation_plan(
@@ -633,24 +832,25 @@ def main() -> None:
         ["method", "Budget", "N_non_emb", "LR"]
     )
     large_all.to_csv(
-        os.path.join(args.results_dir, "analysis", "large_scale_validation_plan.csv"),
+        os.path.join(analysis_dir, "large_scale_validation_plan.csv"),
         index=False,
     )
     large_selected = large_all[large_all["method"] == selected_method].copy()
     large_selected.to_csv(
-        os.path.join(args.results_dir, "analysis", "large_scale_validation_selected.csv"),
+        os.path.join(analysis_dir, "large_scale_validation_selected.csv"),
         index=False,
     )
 
     plot_isoflops_empirical(
         filtered,
         empirical,
-        os.path.join(args.results_dir, "analysis", "isoflops_empirical.png"),
+        os.path.join(analysis_dir, "isoflops_empirical.png"),
     )
     plot_isoflops_quadratic(
         filtered,
         quadratic,
-        os.path.join(args.results_dir, "analysis", "isoflops_quadratic.png"),
+        os.path.join(analysis_dir, "isoflops_quadratic.png"),
+        use_envelope=use_quadratic_envelope,
     )
     plot_scaling(
         summary_emp=empirical,
@@ -658,22 +858,27 @@ def main() -> None:
         fit_emp=fit_emp,
         fit_quad=fit_quad,
         target_budget=args.target_budget,
-        out_n_path=os.path.join(args.results_dir, "analysis", "scaling_N.png"),
-        out_d_path=os.path.join(args.results_dir, "analysis", "scaling_D.png"),
+        out_n_path=os.path.join(analysis_dir, "scaling_N.png"),
+        out_d_path=os.path.join(analysis_dir, "scaling_D.png"),
     )
 
     print("Wrote:")
-    print(f"  {os.path.join(args.results_dir, 'analysis', 'summary.csv')}")
-    print(f"  {os.path.join(args.results_dir, 'analysis', 'prediction.json')}")
-    print(f"  {os.path.join(args.results_dir, 'analysis', 'validation.json')}")
-    print(f"  {os.path.join(args.results_dir, 'analysis', 'large_scale_validation_plan.csv')}")
+    print(f"  {os.path.join(analysis_dir, 'summary.csv')}")
+    print(f"  {os.path.join(analysis_dir, 'prediction.json')}")
+    print(f"  {os.path.join(analysis_dir, 'validation.json')}")
+    print(f"  {os.path.join(analysis_dir, 'large_scale_validation_plan.csv')}")
     print(
-        f"  {os.path.join(args.results_dir, 'analysis', 'large_scale_validation_selected.csv')}"
+        f"  {os.path.join(analysis_dir, 'large_scale_validation_selected.csv')}"
     )
-    print(f"  {os.path.join(args.results_dir, 'analysis', 'isoflops_empirical.png')}")
-    print(f"  {os.path.join(args.results_dir, 'analysis', 'isoflops_quadratic.png')}")
-    print(f"  {os.path.join(args.results_dir, 'analysis', 'scaling_N.png')}")
-    print(f"  {os.path.join(args.results_dir, 'analysis', 'scaling_D.png')}")
+    print(f"  {os.path.join(analysis_dir, 'isoflops_empirical.png')}")
+    print(f"  {os.path.join(analysis_dir, 'isoflops_quadratic.png')}")
+    print(f"  {os.path.join(analysis_dir, 'scaling_N.png')}")
+    print(f"  {os.path.join(analysis_dir, 'scaling_D.png')}")
+    print(
+        "Input policy:"
+        f" dirs={input_dirs}, csv_match_required={not args.allow_missing_csv}, dedup={use_dedup}, "
+        f"quadratic_envelope={use_quadratic_envelope}, monotonic_nopt={use_monotonic_nopt}"
+    )
     print(
         "Validation policy:"
         f" no layer expansion at budgets <= {budget_label(args.max_no_layer_expand_budget)}; "
